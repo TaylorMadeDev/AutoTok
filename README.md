@@ -10,6 +10,15 @@ The creator stays focused on three decisions: choose a story, review the edit,
 and create the video. Less-frequent tools live behind the single **Studio**
 button, while **Review & Publish** appears only after a successful render.
 
+The header's Font Awesome **Settings** button opens one tabbed window for
+Video, Captions, Audio & Voice, Publishing, and Updates. Changes across every
+page are committed together with **Save all settings**.
+
+**Open Video Harvester** uses the preset YouTube playlist and works through it
+one video at a time. It downloads a video at up to 1080p, cuts it into
+sequential one-minute MP4 clips under `videos\Harvested`, and only then starts
+the next playlist item. Use it only for footage you have permission to reuse.
+
 New production and publishing tools include:
 
 - A media preflight for dimensions, duration, FPS, audio, file size, caption
@@ -52,14 +61,14 @@ import, so extra columns are retained for later comparisons.
 The production workflow now includes:
 
 - Local Whisper word timestamps with Karaoke, Purple Pop, and Classic captions.
-- Automatic 60-second, 90-second, three-minute, or full-story series exports.
+- Configurable chunk lengths in seconds, or a single full-story export.
 - Sentence-aware one-minute Flux requests to prevent HTTP 413 errors.
 - Cached narration and alignment, plus fingerprinted resume support.
 - A draggable safe-zone preview and adjustable caption height.
 - Smart least-used footage selection with category subfolders and cached scene cuts.
 - Optional background music with narration-friendly volume mixing.
 - Persistent Reddit batch queue and render history.
-- Voice previews, speed controls, and a custom pronunciation dictionary.
+- Voice previews, whole-video and voice speed controls, and a custom pronunciation dictionary.
 - Uncensored, softened, and platform-safe cleanup modes.
 - `.srt` captions, vertical thumbnails, hooks, descriptions, hashtags, and JSON
   posting packages alongside every MP4.
@@ -76,7 +85,10 @@ The production workflow now includes:
 - Falls back to the local Windows voice if Flux is unavailable.
 - Randomly cuts and center-crops any number of videos to a 9:16 canvas.
 - Generates large, timed, outlined captions and a polished Reddit intro card.
-- Supports a quick 540×960 draft or final 1080×1920 H.264 export.
+- Supports Data saver (360p), Draft (540p), HD (720p), and Full HD (1080p) H.264 exports.
+- Checks GitHub Releases automatically and installs portable Windows updates after approval.
+- Shows a **What's New** window with the release notes and **Update** or
+  **Not yet** actions whenever a newer GitHub release is found at startup.
 
 ## Install from a GitHub release
 
@@ -159,10 +171,16 @@ configured voice badge to test, switch, or replace the provider.
    turn Auto-pick off and use **Choose files**. With no clips, AutoTok uses a
    clean gradient background so you can still test the pipeline.
 3. Edit the story and choose how many words appear in each caption.
-4. Open **Production settings** to select part length, caption animation,
-   profanity handling, Whisper size, music, and voice speed.
+4. In **Export**, choose video quality, whole-video playback speed, and either
+   a chunk length in seconds or **Full story**. Open **Settings** for caption
+   animation, profanity handling, Whisper size, music, voice, publishing, and updates.
 5. Use **Preview** to inspect the safe zone and drag captions vertically.
 6. Render a **Draft** first, then switch to **Full HD** for the final export.
+
+AutoTok checks the repository's latest GitHub Release shortly after launch.
+Portable builds can download the Windows ZIP, replace the installed files after
+AutoTok closes, and restart automatically. Source checkouts open the release page
+so developers can update through Git.
 
 Create category folders such as `videos\Minecraft`, `videos\Racing`, and
 `videos\Cooking`. The category picker discovers them automatically. Put music

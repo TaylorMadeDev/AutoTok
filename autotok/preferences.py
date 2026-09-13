@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -16,6 +17,9 @@ class AppPreferences:
     caption_words: int = 6
     caption_position: float = 0.66
     part_length: str = "90 seconds"
+    video_speed: float = 1.0
+    video_quality: str = "Full HD"
+    auto_update: bool = True
     align_captions: bool = True
     whisper_model: str = "tiny.en"
     profanity_mode: str = "Uncensored"
@@ -38,12 +42,20 @@ class AppPreferences:
 
     @property
     def part_seconds(self) -> int:
-        return {
+        known = {
             "60 seconds": 60,
             "90 seconds": 90,
             "3 minutes": 180,
             "Full story": 0,
-        }.get(self.part_length, 90)
+        }
+        if self.part_length in known:
+            return known[self.part_length]
+        match = re.fullmatch(r"(\d+) seconds", self.part_length.strip())
+        return max(15, min(3600, int(match.group(1)))) if match else 90
+
+    @property
+    def split_enabled(self) -> bool:
+        return self.part_seconds > 0
 
 
 def load_preferences() -> AppPreferences:

@@ -25,7 +25,7 @@ jobs:
       - name: Build portable app
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --windowed --onedir --name AutoTok --collect-all customtkinter --collect-all imageio_ffmpeg --collect-all PIL --collect-all moviepy --collect-all keyring --copy-metadata imageio --copy-metadata imageio-ffmpeg --copy-metadata moviepy --copy-metadata Pillow --hidden-import=autotok app.py
+          pyinstaller --noconfirm --clean --windowed --onedir --name AutoTok --additional-hooks-dir hooks --collect-all customtkinter --collect-all imageio_ffmpeg --collect-all PIL --collect-all moviepy --collect-all keyring --collect-all yt_dlp --copy-metadata imageio --copy-metadata imageio-ffmpeg --copy-metadata moviepy --copy-metadata Pillow --hidden-import=autotok app.py
           $version = (Get-Content VERSION -Raw).Trim()
           Compress-Archive -Path dist\AutoTok\* -DestinationPath "AutoTok-Windows-x64-v$version.zip"
       - name: Upload release asset

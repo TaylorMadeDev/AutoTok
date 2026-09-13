@@ -32,6 +32,7 @@ from moviepy.editor import (  # noqa: E402
     concatenate_videoclips,
 )
 from moviepy.audio.fx import all as audio_fx  # noqa: E402
+from moviepy.video.fx import all as video_fx  # noqa: E402
 
 from .alignment import AlignedWord, align_audio_parts
 from .config import APP_DIR, OpenRouterConfig
@@ -90,6 +91,9 @@ class RenderOptions:
     part_seconds: int = 90
     profanity_mode: str = "Uncensored"
     voice_speed: float = 1.0
+    video_speed: float = 1.0
+    video_bitrate: str | None = None
+    audio_bitrate: str = "192k"
     music_file: Path | None = None
     auto_music: bool = False
     music_volume: float = 0.10
@@ -861,18 +865,31 @@ def render_video(
             layers.append(cover_clip)
             created_clips.append(cover_clip)
             publish_duration += 0.65
-        final = CompositeVideoClip(layers, size=(options.width, options.height)).set_duration(publish_duration).set_audio(audio.set_duration(publish_duration))
+        base_final = CompositeVideoClip(layers, size=(options.width, options.height)).set_duration(publish_duration).set_audio(audio.set_duration(publish_duration))
+        created_clips.append(base_final)
+        playback_speed = max(0.5, min(2.0, options.video_speed))
+        final = base_final.fx(video_fx.speedx, factor=playback_speed)
         created_clips.append(final)
 
-        _notify(progress, 0.62, f"Rendering {total_duration:.1f}s video with {story_engine}")
+        final_duration = publish_duration / playback_speed
+        _notify(progress, 0.62, f"Rendering {final_duration:.1f}s video at {playback_speed:.2f}× with {story_engine}")
         final.write_videofile(
             str(output), fps=options.fps, codec="libx264", audio_codec="aac",
             threads=max(2, min(6, os.cpu_count() or 4)), preset=options.preset,
+            bitrate=options.video_bitrate, audio_bitrate=options.audio_bitrate,
             temp_audiofile=str(work_dir / "render_audio.m4a"), remove_temp=True,
             logger=None,
         )
+        adjusted_chunks = [
+            {
+                **chunk,
+                "start": float(chunk["start"]) / playback_speed,
+                "end": float(chunk["end"]) / playback_speed,
+            }
+            for chunk in chunks
+        ]
         _posting_package(
-            post, output, card_path, chunks, intro_duration, options.width, options.height,
+            post, output, card_path, adjusted_chunks, intro_duration / playback_speed, options.width, options.height,
             options.series_id, options.series_index, options.series_total,
             options.bake_tiktok_cover,
             {
@@ -882,6 +899,8 @@ def render_video(
                 "voice": tts.azure_voice if tts.provider == "azure" else tts.voice,
                 "voice_provider": tts.provider,
                 "voice_speed": options.voice_speed,
+                "video_speed": playback_speed,
+                "video_bitrate": options.video_bitrate,
                 "audio_polish": options.audio_polish,
                 "backgrounds": [str(path) for path in options.background_files],
                 "video_category": options.video_category,
@@ -912,7 +931,10 @@ def render_story_series(
 ) -> list[Path]:
     """Render one video or an automatically numbered short-form series."""
     cleaned = clean_story_for_narration(post.body, options.profanity_mode)
-    story_parts = split_story_parts(cleaned, options.part_seconds)
+    # Splitting happens before rendering. Account for the final playback-speed
+    # transform so a requested 60-second part still lands near 60 seconds.
+    split_target = round(options.part_seconds * max(0.5, min(2.0, options.video_speed)))
+    story_parts = split_story_parts(cleaned, split_target)
     outputs: list[Path] = []
     used_backgrounds: set[Path] = set()
     candidates = options.background_files

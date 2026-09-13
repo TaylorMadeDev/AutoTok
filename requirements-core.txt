@@ -5,3 +5,5 @@ numpy<2.0
 requests>=2.32.0
 imageio-ffmpeg>=0.5.1
 keyring>=25.6.0
+fontawesomefree==6.6.0
+yt-dlp==2026.8.19

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ from autotok.studio import (
 from autotok.config import OpenRouterConfig
 from autotok.engine import synthesize_speech
 from autotok.voices import DEFAULT_FLUX_VOICE, FLUX_VOICES, valid_flux_voice
+from autotok.updater import _safe_extract, is_newer_version
 
 
 class StudioTests(unittest.TestCase):
@@ -41,6 +43,34 @@ class StudioTests(unittest.TestCase):
         result = apply_preset(AppPreferences(), "TIFU 60s")
         self.assertEqual(result.part_length, "60 seconds")
         self.assertEqual(result.caption_style, "Karaoke")
+
+    def test_custom_chunk_seconds_and_full_story(self) -> None:
+        custom = AppPreferences(part_length="75 seconds")
+        full = AppPreferences(part_length="Full story")
+        self.assertEqual(custom.part_seconds, 75)
+        self.assertTrue(custom.split_enabled)
+        self.assertEqual(full.part_seconds, 0)
+        self.assertFalse(full.split_enabled)
+
+    def test_chunk_seconds_are_clamped_to_safe_range(self) -> None:
+        self.assertEqual(AppPreferences(part_length="2 seconds").part_seconds, 15)
+        self.assertEqual(AppPreferences(part_length="9999 seconds").part_seconds, 3600)
+
+    def test_github_release_version_comparison(self) -> None:
+        self.assertTrue(is_newer_version("v1.1.0", "1.0.2"))
+        self.assertFalse(is_newer_version("v1.0.2", "1.0.2"))
+        self.assertFalse(is_newer_version("v1.0.1", "1.0.2"))
+
+    def test_updater_rejects_zip_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            archive = root / "update.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr("../outside.txt", "unsafe")
+                bundle.writestr("AutoTok.exe", "placeholder")
+            with self.assertRaisesRegex(RuntimeError, "unsafe path"):
+                _safe_extract(archive, root / "staged")
+            self.assertFalse((root / "outside.txt").exists())
 
     def test_file_fingerprint_changes_with_content(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

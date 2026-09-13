@@ -21,7 +21,11 @@ music/*
 # Packaging and test artefacts
 build/
 dist/
+build-*/
+dist-*/
+release/
 *.spec
+pyinstaller*.log
 .pytest_cache/
 .coverage
 coverage.xml

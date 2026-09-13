@@ -4,6 +4,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import traceback
 import webbrowser
@@ -14,6 +15,12 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 from PIL import Image
+from PIL import ImageDraw, ImageFont
+
+try:
+    import fontawesomefree
+except ImportError:
+    fontawesomefree = None
 
 from autotok.config import (
     APP_DIR,
@@ -23,6 +30,7 @@ from autotok.config import (
     save_openrouter_config,
 )
 from autotok.engine import RenderOptions, generate_preview_image, render_story_series, synthesize_speech
+from autotok.harvester import DEFAULT_HARVEST_PLAYLIST, HarvestResult, harvest_playlist
 from autotok.jobs import append_history, find_duplicate_story, load_history, load_queue, save_queue, seen_permalinks
 from autotok.library import MUSIC_DIR, VIDEO_DIR, scan_music, scan_videos, video_categories
 from autotok.preferences import AppPreferences, load_preferences, save_preferences
@@ -52,6 +60,7 @@ from autotok.studio import (
     save_draft,
     save_rights_record,
 )
+from autotok.updater import UpdateInfo, check_for_update, download_update, stage_and_launch_update
 from autotok.voices import DEFAULT_FLUX_VOICE, FLUX_VOICES, valid_flux_voice
 
 
@@ -73,6 +82,184 @@ COLORS = {
 }
 
 VIDEO_LIBRARY_DIR = VIDEO_DIR
+
+FA_GLYPHS = {
+    "settings": "\uf013", "video": "\uf03d", "captions": "\uf20a",
+    "audio": "\uf028", "publishing": "\uf093", "updates": "\uf2f1",
+    "harvester": "\uf019", "cut": "\uf0c4",
+}
+
+
+def fontawesome_icon(name: str, size: int = 18, color: str = "#F4F6FC") -> ctk.CTkImage | None:
+    """Render a bundled Font Awesome glyph as a CustomTkinter image."""
+    if fontawesomefree is None or name not in FA_GLYPHS:
+        return None
+    package = Path(fontawesomefree.__file__).resolve().parent
+    font_path = package / "static" / "fontawesomefree" / "webfonts" / "fa-solid-900.ttf"
+    if not font_path.exists():
+        return None
+    try:
+        font = ImageFont.truetype(str(font_path), size=size)
+        image = Image.new("RGBA", (size + 8, size + 8), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        box = draw.textbbox((0, 0), FA_GLYPHS[name], font=font)
+        draw.text(
+            ((image.width - (box[2] - box[0])) / 2 - box[0], (image.height - (box[3] - box[1])) / 2 - box[1]),
+            FA_GLYPHS[name], font=font, fill=color,
+        )
+        return ctk.CTkImage(light_image=image, dark_image=image, size=(size + 2, size + 2))
+    except OSError:
+        return None
+
+
+class VideoHarvesterDialog(ctk.CTkToplevel):
+    def __init__(self, master: "AutoTokApp"):
+        super().__init__(master)
+        self.master_app = master
+        self.title("AutoTok Video Harvester")
+        self.geometry("760x690")
+        self.minsize(680, 610)
+        self.configure(fg_color=COLORS["window"])
+        self.transient(master)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.events: queue.Queue[tuple] = queue.Queue()
+        self.running = False
+
+        heading = ctk.CTkFrame(self, fg_color="transparent")
+        heading.pack(fill="x", padx=28, pady=(24, 8))
+        ctk.CTkLabel(heading, text="", image=fontawesome_icon("harvester", 25, COLORS["accent"]), width=36).pack(side="left", padx=(0, 8))
+        title = ctk.CTkFrame(heading, fg_color="transparent")
+        title.pack(side="left")
+        ctk.CTkLabel(title, text="Video Harvester", text_color=COLORS["text"], font=ctk.CTkFont(size=25, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(title, text="Harvest the preset playlist one video at a time.", text_color=COLORS["muted"]).pack(anchor="w")
+
+        body = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=14, border_width=1, border_color=COLORS["border"])
+        body.pack(fill="both", expand=True, padx=28, pady=(4, 14))
+        ctk.CTkLabel(body, text="PRESET YOUTUBE PLAYLIST", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=18, pady=(18, 6))
+        self.urls = ctk.CTkTextbox(body, height=92, fg_color=COLORS["window"], border_width=1, border_color=COLORS["border"], wrap="word")
+        self.urls.pack(fill="x", padx=18)
+        self.urls.insert("1.0", DEFAULT_HARVEST_PLAYLIST)
+        self.urls.configure(state="disabled")
+        ctk.CTkLabel(body, text="LIBRARY CATEGORY", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=18, pady=(14, 6))
+        self.category = ctk.CTkEntry(body, height=38, fg_color=COLORS["panel_2"], border_color=COLORS["border"])
+        self.category.insert(0, "Harvested")
+        self.category.pack(fill="x", padx=18)
+        ctk.CTkLabel(body, text="AutoTok finishes downloading and cutting each playlist video into sequential 60-second MP4 clips before moving to the next. Only harvest footage you have permission to use.", text_color=COLORS["muted"], justify="left", wraplength=650).pack(anchor="w", padx=18, pady=(12, 8))
+        self.progress = ctk.CTkProgressBar(body, progress_color=COLORS["accent"], fg_color=COLORS["border"])
+        self.progress.set(0)
+        self.progress.pack(fill="x", padx=18, pady=(8, 5))
+        self.status = ctk.CTkLabel(body, text="Ready", text_color=COLORS["muted"], anchor="w")
+        self.status.pack(fill="x", padx=18)
+        self.log = ctk.CTkTextbox(body, height=105, fg_color=COLORS["window"], text_color=COLORS["muted"], font=ctk.CTkFont(family="Consolas", size=10))
+        self.log.pack(fill="both", expand=True, padx=18, pady=(8, 16))
+        self.log.configure(state="disabled")
+
+        actions = ctk.CTkFrame(self, fg_color="transparent")
+        actions.pack(fill="x", padx=28, pady=(0, 22))
+        ctk.CTkButton(actions, text="Open harvested clips", fg_color="transparent", border_width=1, border_color=COLORS["border"], command=self._open_folder).pack(side="left")
+        self.harvest_button = ctk.CTkButton(actions, text="DOWNLOAD & CUT", image=fontawesome_icon("cut", 15), compound="left", width=170, fg_color=COLORS["accent"], command=self._start)
+        self.harvest_button.pack(side="right")
+        self.after(100, self._drain_events)
+
+    def _close(self) -> None:
+        if self.running:
+            messagebox.showinfo("Video Harvester", "The current download is still running.", parent=self)
+            return
+        self.destroy()
+
+    def _write_log(self, message: str) -> None:
+        self.log.configure(state="normal")
+        self.log.insert("end", f"• {message}\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _start(self) -> None:
+        if self.running:
+            return
+        self.running = True
+        self.harvest_button.configure(state="disabled", text="HARVESTING…")
+        self.progress.set(0)
+        category = self.category.get().strip() or "Harvested"
+
+        def worker() -> None:
+            try:
+                results = harvest_playlist(DEFAULT_HARVEST_PLAYLIST, category, 60, lambda value, message: self.events.put(("progress", value, message)))
+                self.events.put(("done", results, category))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _drain_events(self) -> None:
+        try:
+            while True:
+                event = self.events.get_nowait()
+                if event[0] == "progress":
+                    self.progress.set(event[1])
+                    self.status.configure(text=event[2])
+                    self._write_log(event[2])
+                elif event[0] == "done":
+                    results: list[HarvestResult] = event[1]
+                    count = sum(len(result.segments) for result in results)
+                    self.running = False
+                    self.harvest_button.configure(state="normal", text="DOWNLOAD & CUT")
+                    self.progress.set(1)
+                    self.status.configure(text=f"Finished • {count} clips from {len(results)} video(s)", text_color=COLORS["success"])
+                    self.master_app._log(f"Video Harvester added {count} one-minute clips")
+                    self.master_app._refresh_video_library()
+                    messagebox.showinfo("Harvest complete", f"Created {count} clips in videos\\{event[2]}.", parent=self)
+                elif event[0] == "error":
+                    self.running = False
+                    self.harvest_button.configure(state="normal", text="DOWNLOAD & CUT")
+                    self.status.configure(text="Harvest failed", text_color=COLORS["danger"])
+                    self._write_log(event[1])
+                    messagebox.showerror("Video Harvester failed", event[1], parent=self)
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(100, self._drain_events)
+
+    def _open_folder(self) -> None:
+        destination = VIDEO_DIR / (self.category.get().strip() or "Harvested")
+        destination.mkdir(parents=True, exist_ok=True)
+        os.startfile(destination)  # type: ignore[attr-defined]
+
+
+class WhatsNewDialog(ctk.CTkToplevel):
+    def __init__(self, master: "AutoTokApp", info: UpdateInfo):
+        super().__init__(master)
+        self.master_app = master
+        self.info = info
+        self.title(f"What's New in AutoTok {info.version}")
+        self.geometry("620x540")
+        self.minsize(560, 480)
+        self.configure(fg_color=COLORS["window"])
+        self.transient(master)
+        self.grab_set()
+
+        ctk.CTkLabel(self, text="WHAT'S NEW", text_color=COLORS["accent"], font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=30, pady=(28, 5))
+        ctk.CTkLabel(self, text=f"AutoTok {info.version}", text_color=COLORS["text"], font=ctk.CTkFont(size=27, weight="bold")).pack(anchor="w", padx=30)
+        ctk.CTkLabel(self, text="A new version is ready on GitHub.", text_color=COLORS["muted"]).pack(anchor="w", padx=30, pady=(3, 16))
+        notes = ctk.CTkTextbox(self, fg_color=COLORS["panel"], border_width=1, border_color=COLORS["border"], wrap="word", font=ctk.CTkFont(size=13))
+        notes.pack(fill="both", expand=True, padx=30, pady=(0, 16))
+        notes.insert("1.0", info.notes.strip() or "This release includes improvements and fixes for AutoTok.")
+        notes.configure(state="disabled")
+        actions = ctk.CTkFrame(self, fg_color="transparent")
+        actions.pack(fill="x", padx=30, pady=(0, 26))
+        ctk.CTkButton(actions, text="NOT YET", fg_color="transparent", border_width=1, border_color=COLORS["border"], command=self.destroy).pack(side="left")
+        self.update_action = ctk.CTkButton(actions, text="UPDATE", image=fontawesome_icon("updates", 15), compound="left", width=150, fg_color=COLORS["accent"], command=self._update_now)
+        self.update_action.pack(side="right")
+
+    def _update_now(self) -> None:
+        if getattr(sys, "frozen", False):
+            self.update_action.configure(state="disabled", text="STARTING…")
+            self.grab_release()
+            self.destroy()
+            self.master_app._download_and_install_update(self.info)
+        else:
+            webbrowser.open(self.info.release_url)
+            self.destroy()
 
 
 class AdvancedSettingsDialog(ctk.CTkToplevel):
@@ -101,7 +288,14 @@ class AdvancedSettingsDialog(ctk.CTkToplevel):
         )
         self.caption_words.set(prefs.caption_words)
         self.caption_words.pack(fill="x", padx=18, pady=(0, 4))
-        self.part_length = self._option(body, "AUTOMATIC PART LENGTH", ["60 seconds", "90 seconds", "3 minutes", "Full story"], prefs.part_length)
+        ctk.CTkLabel(
+            body, text="VIDEO SPLITTING", text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=10, weight="bold"),
+        ).pack(anchor="w", padx=18, pady=(16, 6))
+        ctk.CTkLabel(
+            body, text="Set chunk length or Full story in the Export panel.",
+            text_color=COLORS["text"], font=ctk.CTkFont(size=12),
+        ).pack(anchor="w", padx=18)
         self.profanity = self._option(body, "PROFANITY MODE", ["Uncensored", "Softened", "Platform-safe"], prefs.profanity_mode)
         self.whisper_model = self._option(body, "WHISPER ALIGNMENT MODEL", ["tiny.en", "base.en", "small.en"], prefs.whisper_model)
 
@@ -121,6 +315,8 @@ class AdvancedSettingsDialog(ctk.CTkToplevel):
         ctk.CTkSwitch(body, text="Warn before rendering duplicate stories", variable=self.duplicate_var, progress_color=COLORS["accent"]).pack(anchor="w", padx=18, pady=8)
         self.notifications_var = ctk.BooleanVar(value=prefs.desktop_notifications)
         ctk.CTkSwitch(body, text="Desktop notifications for failures", variable=self.notifications_var, progress_color=COLORS["accent"]).pack(anchor="w", padx=18, pady=8)
+        self.auto_update_var = ctk.BooleanVar(value=prefs.auto_update)
+        ctk.CTkSwitch(body, text="Automatically check GitHub for updates", variable=self.auto_update_var, progress_color=COLORS["accent"]).pack(anchor="w", padx=18, pady=8)
 
         self.speed_label = self._slider_label(body, "VOICE SPEED", prefs.voice_speed, "×")
         self.speed = ctk.CTkSlider(body, from_=0.85, to=1.15, number_of_steps=6, progress_color=COLORS["accent"], command=lambda v: self.speed_label.configure(text=f"VOICE SPEED  •  {v:.2f}×"))
@@ -164,7 +360,6 @@ class AdvancedSettingsDialog(ctk.CTkToplevel):
         prefs = self.master_app.preferences
         prefs.caption_style = self.caption_style.get()
         prefs.caption_words = int(round(self.caption_words.get()))
-        prefs.part_length = self.part_length.get()
         prefs.profanity_mode = self.profanity.get()
         prefs.whisper_model = self.whisper_model.get()
         prefs.align_captions = self.align_var.get()
@@ -175,6 +370,7 @@ class AdvancedSettingsDialog(ctk.CTkToplevel):
         prefs.bake_tiktok_cover = self.cover_var.get()
         prefs.duplicate_check = self.duplicate_var.get()
         prefs.desktop_notifications = self.notifications_var.get()
+        prefs.auto_update = self.auto_update_var.get()
         prefs.voice_speed = round(self.speed.get(), 2)
         prefs.music_volume = self.music_volume.get() / 100.0
         save_preferences(prefs)
@@ -299,33 +495,51 @@ class ListDialog(ctk.CTkToplevel):
 
 
 class SettingsDialog(ctk.CTkToplevel):
-    def __init__(self, master: "AutoTokApp", current: OpenRouterConfig):
+    """Central home for every persistent production setting."""
+
+    def __init__(self, master: "AutoTokApp", current: OpenRouterConfig, initial_page: str = "Video"):
         super().__init__(master)
         self.master_app = master
-        self.title("Voice & API settings")
-        self.geometry("620x760")
-        self.resizable(False, False)
+        self.current_config = current
+        self.title("AutoTok Settings")
+        self.geometry("900x790")
+        self.minsize(800, 700)
         self.configure(fg_color=COLORS["window"])
         self.transient(master)
         self.grab_set()
 
-        ctk.CTkLabel(
-            self, text="Voice & API settings", font=ctk.CTkFont(size=24, weight="bold"),
-            text_color=COLORS["text"]
-        ).pack(anchor="w", padx=30, pady=(28, 5))
-        ctk.CTkLabel(
-            self,
-            text="Choose OpenRouter Flux or Azure Speech. Keys are stored in Windows Credential Manager when available.",
-            justify="left", text_color=COLORS["muted"], font=ctk.CTkFont(size=13)
-        ).pack(anchor="w", padx=30, pady=(0, 20))
+        heading = ctk.CTkFrame(self, fg_color="transparent")
+        heading.pack(fill="x", padx=30, pady=(24, 10))
+        gear = fontawesome_icon("settings", 24, COLORS["accent"])
+        ctk.CTkLabel(heading, text="", image=gear, width=34).pack(side="left", padx=(0, 8))
+        title = ctk.CTkFrame(heading, fg_color="transparent")
+        title.pack(side="left")
+        ctk.CTkLabel(title, text="Settings", font=ctk.CTkFont(size=26, weight="bold"), text_color=COLORS["text"]).pack(anchor="w")
+        ctk.CTkLabel(title, text="All AutoTok preferences in one place.", text_color=COLORS["muted"], font=ctk.CTkFont(size=12)).pack(anchor="w")
+
+        pages = ("Video", "Captions", "Audio & Voice", "Publishing", "Updates")
+        self.tabs = ctk.CTkTabview(
+            self, fg_color=COLORS["panel"], border_width=1, border_color=COLORS["border"],
+            segmented_button_selected_color=COLORS["accent"],
+            segmented_button_selected_hover_color=COLORS["accent_hover"],
+        )
+        self.tabs.pack(fill="both", expand=True, padx=28, pady=(0, 10))
+        for page in pages:
+            self.tabs.add(page)
+        requested = "Audio & Voice" if initial_page == "Audio" else initial_page
+        self.tabs.set(requested if requested in pages else "Video")
+        self._build_video_page(self.tabs.tab("Video"))
+        self._build_captions_page(self.tabs.tab("Captions"))
+        audio_tab = self.tabs.tab("Audio & Voice")
+        self._page_heading(audio_tab, "audio", "Audio & Voice", "Narration provider, voice, speed, and music")
 
         self.provider_var = ctk.StringVar(value="Azure Speech" if current.provider == "azure" else "OpenRouter Flux")
         ctk.CTkSegmentedButton(
-            self, values=["OpenRouter Flux", "Azure Speech"], variable=self.provider_var,
+            audio_tab, values=["OpenRouter Flux", "Azure Speech"], variable=self.provider_var,
             selected_color=COLORS["accent"], selected_hover_color=COLORS["accent_hover"],
-        ).pack(fill="x", padx=30, pady=(0, 12))
-        form = ctk.CTkScrollableFrame(self, fg_color=COLORS["panel"], corner_radius=14, border_width=1, border_color=COLORS["border"], height=420)
-        form.pack(fill="x", padx=30)
+        ).pack(fill="x", padx=20, pady=(0, 10))
+        form = ctk.CTkScrollableFrame(audio_tab, fg_color=COLORS["panel_2"], corner_radius=12, height=260)
+        form.pack(fill="both", expand=True, padx=20)
         self.key_entry = self._field(form, "OPENROUTER API KEY", current.api_key, show="•")
         self.model_entry = self._field(form, "FLUX MODEL", current.model)
         self.voice_entry = self._field(form, "FLUX VOICE ID", current.voice)
@@ -335,8 +549,8 @@ class SettingsDialog(ctk.CTkToplevel):
         source_text = f"Loaded from: {current.source}" if current.source else "No saved key detected"
         ctk.CTkLabel(form, text=source_text, text_color=COLORS["muted"], font=ctk.CTkFont(size=11), wraplength=470).pack(anchor="w", padx=20, pady=(0, 18))
 
-        voices = ctk.CTkFrame(self, fg_color="transparent")
-        voices.pack(fill="x", padx=30, pady=(12, 0))
+        voices = ctk.CTkFrame(form, fg_color="transparent")
+        voices.pack(fill="x", padx=20, pady=(12, 0))
         ctk.CTkLabel(voices, text="ALL FLUX VOICES", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(side="left")
         self.voice_picker = ctk.CTkOptionMenu(
             voices,
@@ -346,14 +560,173 @@ class SettingsDialog(ctk.CTkToplevel):
         )
         self.voice_picker.set(valid_flux_voice(current.voice))
         self.voice_picker.pack(side="right")
-        self.test_status = ctk.CTkLabel(self, text="", text_color=COLORS["muted"], font=ctk.CTkFont(size=11))
-        self.test_status.pack(anchor="w", padx=30, pady=(8, 0))
+        self.voice_speed_label = self._slider_label(form, "VOICE SPEED", master.preferences.voice_speed, "×")
+        self.voice_speed = ctk.CTkSlider(form, from_=0.85, to=1.15, number_of_steps=6, progress_color=COLORS["accent"], command=lambda v: self.voice_speed_label.configure(text=f"VOICE SPEED  •  {v:.2f}×"))
+        self.voice_speed.set(master.preferences.voice_speed)
+        self.voice_speed.pack(fill="x", padx=20)
+        self.auto_music_var = ctk.BooleanVar(value=master.preferences.auto_music)
+        ctk.CTkSwitch(form, text="Automatically choose background music", variable=self.auto_music_var, progress_color=COLORS["accent"]).pack(anchor="w", padx=20, pady=(16, 5))
+        self.audio_polish_var = ctk.BooleanVar(value=master.preferences.audio_polish)
+        ctk.CTkSwitch(form, text="Normalize narration and add fades", variable=self.audio_polish_var, progress_color=COLORS["accent"]).pack(anchor="w", padx=20, pady=5)
+        self.music_volume_label = self._slider_label(form, "MUSIC VOLUME", master.preferences.music_volume * 100, "%")
+        self.music_volume = ctk.CTkSlider(form, from_=0, to=25, number_of_steps=25, progress_color=COLORS["accent"], command=lambda v: self.music_volume_label.configure(text=f"MUSIC VOLUME  •  {v:.0f}%"))
+        self.music_volume.set(master.preferences.music_volume * 100)
+        self.music_volume.pack(fill="x", padx=20, pady=(0, 12))
+        library_actions = ctk.CTkFrame(form, fg_color="transparent")
+        library_actions.pack(fill="x", padx=20, pady=(0, 8))
+        ctk.CTkButton(library_actions, text="Open music folder", fg_color=COLORS["panel_2"], command=lambda: self._open_file(MUSIC_DIR)).pack(side="left")
+        ctk.CTkButton(library_actions, text="Edit pronunciations", fg_color=COLORS["panel_2"], command=lambda: self._open_file(APP_DIR / "pronunciations.json")).pack(side="left", padx=8)
+        voice_actions = ctk.CTkFrame(form, fg_color="transparent")
+        voice_actions.pack(fill="x", padx=20, pady=(4, 4))
+        ctk.CTkButton(voice_actions, text="Get OpenRouter key", fg_color="transparent", border_width=1, border_color=COLORS["border"], command=lambda: webbrowser.open("https://openrouter.ai/settings/keys")).pack(side="left")
+        ctk.CTkButton(voice_actions, text="Test voice", fg_color=COLORS["accent"], command=self._test_voice).pack(side="left", padx=8)
+        self.test_status = ctk.CTkLabel(form, text="", text_color=COLORS["muted"], font=ctk.CTkFont(size=11), wraplength=650, justify="left")
+        self.test_status.pack(anchor="w", padx=20, pady=(4, 14))
+
+        self._build_publishing_page(self.tabs.tab("Publishing"))
+        self._build_updates_page(self.tabs.tab("Updates"))
 
         actions = ctk.CTkFrame(self, fg_color="transparent")
-        actions.pack(fill="x", padx=30, pady=24)
-        ctk.CTkButton(actions, text="Get an OpenRouter key", fg_color="transparent", border_width=1, border_color=COLORS["border"], command=lambda: webbrowser.open("https://openrouter.ai/settings/keys")).pack(side="left")
-        ctk.CTkButton(actions, text="Test voice", fg_color=COLORS["panel_2"], command=self._test_voice).pack(side="left", padx=8)
-        ctk.CTkButton(actions, text="Save settings", fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"], command=self._save).pack(side="right")
+        actions.pack(fill="x", padx=30, pady=(0, 20))
+        ctk.CTkButton(actions, text="Cancel", fg_color="transparent", border_width=1, border_color=COLORS["border"], command=self.destroy).pack(side="left")
+        ctk.CTkButton(actions, text="Save all settings", width=160, fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"], command=self._save).pack(side="right")
+
+    def _page_heading(self, parent, icon_name: str, title: str, subtitle: str) -> None:
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=(18, 12))
+        icon = fontawesome_icon(icon_name, 19, COLORS["accent"])
+        icon_label = ctk.CTkLabel(row, text="", image=icon, width=30)
+        icon_label.pack(side="left", padx=(0, 6))
+        block = ctk.CTkFrame(row, fg_color="transparent")
+        block.pack(side="left")
+        ctk.CTkLabel(block, text=title, text_color=COLORS["text"], font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(block, text=subtitle, text_color=COLORS["muted"], font=ctk.CTkFont(size=11)).pack(anchor="w")
+
+    def _option(self, parent, label: str, values: list[str], value: str) -> ctk.StringVar:
+        ctk.CTkLabel(parent, text=label, text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=20, pady=(14, 5))
+        variable = ctk.StringVar(value=value if value in values else values[0])
+        ctk.CTkOptionMenu(parent, values=values, variable=variable, fg_color=COLORS["panel_2"], button_color=COLORS["accent"], button_hover_color=COLORS["accent_hover"]).pack(fill="x", padx=20)
+        return variable
+
+    def _slider_label(self, parent, label: str, value: float, suffix: str):
+        shown = f"{value:.2f}" if suffix == "×" else f"{value:.0f}"
+        widget = ctk.CTkLabel(parent, text=f"{label}  •  {shown}{suffix}", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold"))
+        widget.pack(anchor="w", padx=20, pady=(14, 5))
+        return widget
+
+    def _build_video_page(self, tab) -> None:
+        prefs = self.master_app.preferences
+        self._page_heading(tab, "video", "Video", "Export quality, playback speed, splitting, and footage")
+        body = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+        self.video_quality_var = self._option(body, "EXPORT QUALITY", ["Data saver", "Draft", "HD", "Full HD"], prefs.video_quality)
+        self.video_speed_label = self._slider_label(body, "WHOLE VIDEO SPEED", prefs.video_speed, "×")
+        self.video_speed = ctk.CTkSlider(body, from_=0.5, to=2.0, number_of_steps=30, progress_color=COLORS["accent"], command=lambda v: self.video_speed_label.configure(text=f"WHOLE VIDEO SPEED  •  {v:.2f}×"))
+        self.video_speed.set(prefs.video_speed)
+        self.video_speed.pack(fill="x", padx=20)
+        split_row = ctk.CTkFrame(body, fg_color=COLORS["panel_2"], corner_radius=10)
+        split_row.pack(fill="x", padx=20, pady=(16, 5))
+        self.settings_split_var = ctk.BooleanVar(value=prefs.split_enabled)
+        ctk.CTkSwitch(split_row, text="Split long stories into chunks", variable=self.settings_split_var, command=self._settings_split_changed, progress_color=COLORS["accent"]).pack(side="left", padx=14, pady=12)
+        self.settings_chunk_entry = ctk.CTkEntry(split_row, width=78, justify="center")
+        self.settings_chunk_entry.insert(0, str(prefs.part_seconds or 90))
+        self.settings_chunk_entry.pack(side="right", padx=(5, 14), pady=10)
+        self.settings_chunk_unit = ctk.CTkLabel(split_row, text="seconds", text_color=COLORS["muted"])
+        self.settings_chunk_unit.pack(side="right")
+        self._settings_split_changed()
+        self.scene_aware_var = ctk.BooleanVar(value=prefs.scene_aware)
+        ctk.CTkSwitch(body, text="Use scene-aware footage cuts", variable=self.scene_aware_var, progress_color=COLORS["accent"]).pack(anchor="w", padx=20, pady=(12, 5))
+        self.smart_match_var = ctk.BooleanVar(value=prefs.smart_match_background)
+        ctk.CTkSwitch(body, text="Match footage category to story mood", variable=self.smart_match_var, progress_color=COLORS["accent"]).pack(anchor="w", padx=20, pady=5)
+        self.cover_var = ctk.BooleanVar(value=prefs.bake_tiktok_cover)
+        ctk.CTkSwitch(body, text="Bake a selectable TikTok cover frame", variable=self.cover_var, progress_color=COLORS["accent"]).pack(anchor="w", padx=20, pady=5)
+
+    def _settings_split_changed(self) -> None:
+        enabled = self.settings_split_var.get()
+        self.settings_chunk_entry.configure(state="normal" if enabled else "disabled")
+        self.settings_chunk_unit.configure(text_color=COLORS["muted"] if enabled else COLORS["border"])
+
+    def _build_captions_page(self, tab) -> None:
+        prefs = self.master_app.preferences
+        self._page_heading(tab, "captions", "Captions", "Style, timing, position, alignment, and text cleanup")
+        body = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+        self.caption_style_var = self._option(body, "CAPTION STYLE", ["Karaoke", "Purple Pop", "Classic"], prefs.caption_style)
+        self.caption_words_label = self._slider_label(body, "WORDS PER CAPTION", prefs.caption_words, " words")
+        self.caption_words = ctk.CTkSlider(body, from_=3, to=10, number_of_steps=7, progress_color=COLORS["accent"], command=lambda v: self.caption_words_label.configure(text=f"WORDS PER CAPTION  •  {v:.0f} words"))
+        self.caption_words.set(prefs.caption_words)
+        self.caption_words.pack(fill="x", padx=20)
+        self.caption_position_label = self._slider_label(body, "CAPTION HEIGHT", prefs.caption_position * 100, "%")
+        self.caption_position = ctk.CTkSlider(body, from_=0.35, to=0.76, number_of_steps=41, progress_color=COLORS["accent"], command=lambda v: self.caption_position_label.configure(text=f"CAPTION HEIGHT  •  {v * 100:.0f}%"))
+        self.caption_position.set(prefs.caption_position)
+        self.caption_position.pack(fill="x", padx=20)
+        self.profanity_var = self._option(body, "PROFANITY MODE", ["Uncensored", "Softened", "Platform-safe"], prefs.profanity_mode)
+        self.whisper_model_var = self._option(body, "WHISPER ALIGNMENT MODEL", ["tiny.en", "base.en", "small.en"], prefs.whisper_model)
+        self.align_captions_var = ctk.BooleanVar(value=prefs.align_captions)
+        ctk.CTkSwitch(body, text="Use word-level Whisper alignment", variable=self.align_captions_var, progress_color=COLORS["accent"]).pack(anchor="w", padx=20, pady=(16, 5))
+
+    def _build_publishing_page(self, tab) -> None:
+        prefs = self.master_app.preferences
+        self._page_heading(tab, "publishing", "Publishing", "Default destination, account, privacy, and safeguards")
+        body = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+        self.publish_provider_var = self._option(body, "DEFAULT DESTINATION", ["Export only", "Community uploader"], prefs.default_publish_provider)
+        self.privacy_var = self._option(body, "DEFAULT PRIVACY", ["Private test", "Public upload"], prefs.default_privacy)
+        self.account_entry = self._field(body, "TIKTOK ACCOUNT PROFILE", prefs.tiktok_account)
+        self.spacing_entry = self._field(body, "SERIES SPACING IN HOURS", str(prefs.schedule_spacing_hours))
+        self.duplicate_var = ctk.BooleanVar(value=prefs.duplicate_check)
+        ctk.CTkSwitch(body, text="Warn before rendering duplicate stories", variable=self.duplicate_var, progress_color=COLORS["accent"]).pack(anchor="w", padx=20, pady=(16, 5))
+        self.notifications_var = ctk.BooleanVar(value=prefs.desktop_notifications)
+        ctk.CTkSwitch(body, text="Show desktop notifications", variable=self.notifications_var, progress_color=COLORS["accent"]).pack(anchor="w", padx=20, pady=5)
+        ctk.CTkButton(body, text="Open uploader setup", fg_color=COLORS["panel_2"], command=self._open_uploader_setup).pack(anchor="w", padx=20, pady=16)
+
+    def _open_uploader_setup(self) -> None:
+        self.grab_release()
+        self.destroy()
+        dialog = StudioDialog(self.master_app)
+        dialog.tabs.set("Publishing")
+
+    def _build_updates_page(self, tab) -> None:
+        from autotok import __version__
+
+        prefs = self.master_app.preferences
+        self._page_heading(tab, "updates", "Updates", "Keep AutoTok current through GitHub Releases")
+        card = ctk.CTkFrame(tab, fg_color=COLORS["panel_2"], corner_radius=12)
+        card.pack(fill="x", padx=20, pady=8)
+        ctk.CTkLabel(card, text=f"AutoTok {__version__}", text_color=COLORS["text"], font=ctk.CTkFont(size=17, weight="bold")).pack(anchor="w", padx=16, pady=(15, 3))
+        ctk.CTkLabel(card, text="Updates are checked against TaylorMadeDev/AutoTok on GitHub.", text_color=COLORS["muted"]).pack(anchor="w", padx=16, pady=(0, 14))
+        self.auto_update_var = ctk.BooleanVar(value=prefs.auto_update)
+        ctk.CTkSwitch(tab, text="Automatically check for updates at startup", variable=self.auto_update_var, progress_color=COLORS["accent"]).pack(anchor="w", padx=20, pady=(14, 8))
+        self.settings_update_button = ctk.CTkButton(tab, text="Check for updates now", image=fontawesome_icon("updates", 15), compound="left", fg_color=COLORS["accent"], command=self._check_update_from_settings)
+        self.settings_update_button.pack(anchor="w", padx=20, pady=8)
+        self.settings_update_status = ctk.CTkLabel(tab, text="", text_color=COLORS["muted"], wraplength=650, justify="left")
+        self.settings_update_status.pack(anchor="w", padx=20, pady=4)
+
+    def _check_update_from_settings(self) -> None:
+        self.settings_update_button.configure(state="disabled", text="Checking GitHub…")
+        self.settings_update_status.configure(text="Contacting GitHub Releases…", text_color=COLORS["muted"])
+
+        def worker() -> None:
+            try:
+                info = check_for_update()
+                self.after(0, lambda: self._settings_update_done(info, None))
+            except Exception as exc:
+                self.after(0, lambda: self._settings_update_done(None, str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _settings_update_done(self, info: UpdateInfo | None, error: str | None) -> None:
+        if not self.winfo_exists():
+            return
+        self.settings_update_button.configure(state="normal", text="Check for updates now")
+        if error:
+            self.settings_update_status.configure(text=error, text_color=COLORS["danger"])
+        elif not info:
+            self.settings_update_status.configure(text="You have the latest AutoTok release.", text_color=COLORS["success"])
+        else:
+            self.grab_release()
+            self.destroy()
+            self.master_app.whats_new_dialog = WhatsNewDialog(self.master_app, info)
 
     def _field(self, parent, label: str, value: str, show: str = "") -> ctk.CTkEntry:
         ctk.CTkLabel(parent, text=label, text_color=COLORS["muted"], font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=20, pady=(16, 6))
@@ -362,7 +735,63 @@ class SettingsDialog(ctk.CTkToplevel):
         entry.insert(0, value)
         return entry
 
+    def _open_file(self, path: Path) -> None:
+        if path.is_dir():
+            path.mkdir(parents=True, exist_ok=True)
+        os.startfile(path)  # type: ignore[attr-defined]
+
     def _save(self) -> None:
+        if self.settings_split_var.get():
+            try:
+                chunk_seconds = int(self.settings_chunk_entry.get().strip())
+            except ValueError:
+                messagebox.showerror("Invalid chunk length", "Chunk length must be a whole number of seconds.", parent=self)
+                self.tabs.set("Video")
+                return
+            if not 15 <= chunk_seconds <= 3600:
+                messagebox.showerror("Invalid chunk length", "Chunk length must be between 15 and 3600 seconds.", parent=self)
+                self.tabs.set("Video")
+                return
+            part_length = f"{chunk_seconds} seconds"
+        else:
+            part_length = "Full story"
+        try:
+            spacing = int(self.spacing_entry.get().strip())
+        except ValueError:
+            messagebox.showerror("Invalid schedule spacing", "Series spacing must be a whole number of hours.", parent=self)
+            self.tabs.set("Publishing")
+            return
+        if not 1 <= spacing <= 168:
+            messagebox.showerror("Invalid schedule spacing", "Series spacing must be between 1 and 168 hours.", parent=self)
+            self.tabs.set("Publishing")
+            return
+
+        prefs = self.master_app.preferences
+        prefs.video_quality = self.video_quality_var.get()
+        prefs.video_speed = round(self.video_speed.get(), 2)
+        prefs.part_length = part_length
+        prefs.scene_aware = self.scene_aware_var.get()
+        prefs.smart_match_background = self.smart_match_var.get()
+        prefs.bake_tiktok_cover = self.cover_var.get()
+        prefs.caption_style = self.caption_style_var.get()
+        prefs.caption_words = int(round(self.caption_words.get()))
+        prefs.caption_position = round(self.caption_position.get(), 3)
+        prefs.profanity_mode = self.profanity_var.get()
+        prefs.whisper_model = self.whisper_model_var.get()
+        prefs.align_captions = self.align_captions_var.get()
+        prefs.voice_speed = round(self.voice_speed.get(), 2)
+        prefs.auto_music = self.auto_music_var.get()
+        prefs.audio_polish = self.audio_polish_var.get()
+        prefs.music_volume = self.music_volume.get() / 100.0
+        prefs.default_publish_provider = self.publish_provider_var.get()
+        prefs.default_privacy = self.privacy_var.get()
+        prefs.tiktok_account = self.account_entry.get().strip()
+        prefs.schedule_spacing_hours = spacing
+        prefs.duplicate_check = self.duplicate_var.get()
+        prefs.desktop_notifications = self.notifications_var.get()
+        prefs.auto_update = self.auto_update_var.get()
+        save_preferences(prefs)
+
         config = OpenRouterConfig(
             provider="azure" if self.provider_var.get() == "Azure Speech" else "flux",
             api_key=self.key_entry.get().strip(),
@@ -372,12 +801,11 @@ class SettingsDialog(ctk.CTkToplevel):
             azure_region=self.azure_region_entry.get().strip(),
             azure_voice=self.azure_voice_entry.get().strip(),
         )
-        if not config.configured:
-            messagebox.showwarning("Missing voice settings", "Complete the selected provider, or cancel to keep using the Windows voice fallback.", parent=self)
-            return
         save_openrouter_config(config)
         self.master_app.tts_config = load_openrouter_config()
         self.master_app.update_key_badge()
+        self.master_app._apply_preferences_to_ui()
+        self.master_app._log("All settings saved")
         self.destroy()
 
     def _pick_voice(self, voice: str) -> None:
@@ -579,7 +1007,10 @@ class StudioDialog(ctk.CTkToplevel):
         self.publish_status.pack(anchor="w", padx=18, pady=(18, 10))
         ctk.CTkButton(tab, text="Set up / update community uploader", fg_color=COLORS["accent"], command=self._setup_uploader).pack(anchor="w", padx=18)
         ctk.CTkLabel(tab, text="Experimental: this third-party uploader controls a visible Chromium browser. AutoTok disables optional stealth mode and never stores your TikTok password. You handle login and any account challenge yourself.", justify="left", wraplength=690, text_color=COLORS["orange"]).pack(anchor="w", padx=18, pady=16)
-        ctk.CTkButton(tab, text="Production settings", fg_color=COLORS["panel_2"], command=lambda: AdvancedSettingsDialog(self.master_app)).pack(anchor="w", padx=18, pady=5)
+        ctk.CTkButton(
+            tab, text="All settings", image=fontawesome_icon("settings", 15), compound="left",
+            fg_color=COLORS["panel_2"], command=lambda: SettingsDialog(self.master_app, self.master_app.tts_config, "Video"),
+        ).pack(anchor="w", padx=18, pady=5)
         self._refresh_uploader_status()
 
     def _refresh_uploader_status(self) -> None:
@@ -856,6 +1287,8 @@ class AutoTokApp(ctk.CTk):
         self._build_editor()
         self._build_render_panel()
         self.after(100, self._drain_events)
+        if self.preferences.auto_update:
+            self.after(1200, lambda: self._check_for_updates(manual=False))
 
     def _build_header(self) -> None:
         header = ctk.CTkFrame(self, height=68, corner_radius=0, fg_color=COLORS["panel"], border_width=0)
@@ -867,21 +1300,30 @@ class AutoTokApp(ctk.CTk):
         ctk.CTkLabel(logo, text="AutoTok", text_color=COLORS["text"], font=ctk.CTkFont(size=23, weight="bold")).pack(side="left")
         ctk.CTkLabel(logo, text="STORY STUDIO", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(side="left", padx=12, pady=(6, 0))
 
-        self.key_badge = ctk.CTkButton(header, height=34, width=160, corner_radius=17, command=self._open_settings, font=ctk.CTkFont(size=12, weight="bold"))
+        self.key_badge = ctk.CTkButton(
+            header, height=34, width=170, corner_radius=17, command=self._open_settings,
+            image=fontawesome_icon("settings", 15), compound="left", font=ctk.CTkFont(size=11, weight="bold"),
+        )
         ctk.CTkButton(
             header, text="STUDIO", height=34, fg_color="transparent",
             hover_color=COLORS["panel_2"], border_width=1, border_color=COLORS["border"],
             command=lambda: StudioDialog(self), font=ctk.CTkFont(size=11, weight="bold")
         ).grid(row=0, column=2, padx=(8, 0))
-        self.key_badge.grid(row=0, column=3, padx=24)
+        self.update_button = ctk.CTkButton(
+            header, text="CHECK UPDATE", width=112, height=34, fg_color="transparent",
+            hover_color=COLORS["panel_2"], border_width=1, border_color=COLORS["border"],
+            command=lambda: self._check_for_updates(manual=True), font=ctk.CTkFont(size=10, weight="bold"),
+        )
+        self.update_button.grid(row=0, column=3, padx=(8, 0))
+        self.key_badge.grid(row=0, column=4, padx=24)
         self.update_key_badge()
 
     def update_key_badge(self) -> None:
         if self.tts_config.configured:
             provider = "AZURE" if self.tts_config.provider == "azure" else "FLUX"
-            self.key_badge.configure(text=f"●  {provider} CONFIGURED", fg_color="#173329", hover_color="#204538", text_color=COLORS["success"])
+            self.key_badge.configure(text=f"SETTINGS  •  {provider}", fg_color="#173329", hover_color="#204538", text_color=COLORS["success"])
         else:
-            self.key_badge.configure(text="SET UP AI VOICE", fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"], text_color="white")
+            self.key_badge.configure(text="SETTINGS  •  VOICE", fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"], text_color="white")
 
     def _section_title(self, parent, number: str, title: str, subtitle: str) -> None:
         row = ctk.CTkFrame(parent, fg_color="transparent")
@@ -948,6 +1390,12 @@ class AutoTokApp(ctk.CTk):
             command=self._choose_videos
         )
         self.footage_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.harvester_button = ctk.CTkButton(
+            panel, text="OPEN VIDEO HARVESTER", image=fontawesome_icon("harvester", 15),
+            compound="left", height=40, fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+            command=lambda: VideoHarvesterDialog(self), font=ctk.CTkFont(size=11, weight="bold"),
+        )
+        self.harvester_button.pack(fill="x", padx=20, pady=(8, 0))
         self.footage_label = ctk.CTkLabel(panel, text="", justify="left", text_color=COLORS["muted"], font=ctk.CTkFont(size=11), wraplength=245)
         self.footage_label.pack(anchor="w", padx=20, pady=7)
         self._toggle_auto_video()
@@ -991,8 +1439,39 @@ class AutoTokApp(ctk.CTk):
         settings = ctk.CTkFrame(panel, fg_color=COLORS["panel_2"], corner_radius=12)
         settings.pack(fill="x", padx=20)
         ctk.CTkLabel(settings, text="QUALITY", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=14, pady=(14, 7))
-        self.quality_var = ctk.StringVar(value="Full HD")
-        ctk.CTkSegmentedButton(settings, values=["Draft", "Full HD"], variable=self.quality_var, selected_color=COLORS["accent"], selected_hover_color=COLORS["accent_hover"]).pack(fill="x", padx=14)
+        quality_values = ["Data saver", "Draft", "HD", "Full HD"]
+        initial_quality = self.preferences.video_quality if self.preferences.video_quality in quality_values else "Full HD"
+        self.quality_var = ctk.StringVar(value=initial_quality)
+        ctk.CTkOptionMenu(
+            settings, values=quality_values, variable=self.quality_var,
+            command=self._quality_changed, fg_color=COLORS["window"],
+            button_color=COLORS["accent"], button_hover_color=COLORS["accent_hover"],
+        ).pack(fill="x", padx=14)
+        self.speed_label = ctk.CTkLabel(
+            settings, text=f"VIDEO SPEED  •  {self.preferences.video_speed:.2f}×",
+            text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold"),
+        )
+        self.speed_label.pack(anchor="w", padx=14, pady=(15, 7))
+        self.video_speed_slider = ctk.CTkSlider(
+            settings, from_=0.5, to=2.0, number_of_steps=30,
+            progress_color=COLORS["accent"], command=self._video_speed_changed,
+        )
+        self.video_speed_slider.set(self.preferences.video_speed)
+        self.video_speed_slider.pack(fill="x", padx=14)
+        split_row = ctk.CTkFrame(settings, fg_color="transparent")
+        split_row.pack(fill="x", padx=14, pady=(15, 5))
+        self.split_video_var = ctk.BooleanVar(value=self.preferences.split_enabled)
+        ctk.CTkSwitch(
+            split_row, text="Split into chunks", variable=self.split_video_var,
+            command=self._split_changed, progress_color=COLORS["accent"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+        ).pack(side="left")
+        self.chunk_seconds_entry = ctk.CTkEntry(split_row, width=62, height=30, justify="center")
+        self.chunk_seconds_entry.insert(0, str(self.preferences.part_seconds or 90))
+        self.chunk_seconds_entry.pack(side="right")
+        self.chunk_unit_label = ctk.CTkLabel(split_row, text="sec", text_color=COLORS["muted"], font=ctk.CTkFont(size=10))
+        self.chunk_unit_label.pack(side="right", padx=(0, 5))
+        self._split_changed()
         ctk.CTkLabel(settings, text="FORMAT", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=14, pady=(15, 7))
         ctk.CTkLabel(settings, text="9:16 vertical  •  MP4  •  H.264", text_color=COLORS["text"], font=ctk.CTkFont(size=12)).pack(anchor="w", padx=14, pady=(0, 14))
 
@@ -1038,6 +1517,19 @@ class AutoTokApp(ctk.CTk):
         self.preferences.caption_words = words
         if hasattr(self, "words_label"):
             self.words_label.configure(text=f"{words} words per caption")
+
+    def _quality_changed(self, value: str) -> None:
+        self.preferences.video_quality = value
+        save_preferences(self.preferences)
+
+    def _video_speed_changed(self, value: float) -> None:
+        self.preferences.video_speed = round(float(value), 2)
+        self.speed_label.configure(text=f"VIDEO SPEED  •  {self.preferences.video_speed:.2f}×")
+
+    def _split_changed(self) -> None:
+        state = "normal" if self.split_video_var.get() else "disabled"
+        self.chunk_seconds_entry.configure(state=state)
+        self.chunk_unit_label.configure(text_color=COLORS["muted"] if state == "normal" else COLORS["border"])
 
     def _caption_position_changed(self, value: float) -> None:
         self.preferences.caption_position = float(value)
@@ -1242,14 +1734,33 @@ class AutoTokApp(ctk.CTk):
                 parent=self,
             ):
                 return
-        options = self._make_render_options(self.output_path)
+        try:
+            options = self._make_render_options(self.output_path)
+        except ValueError as exc:
+            messagebox.showerror("Invalid export setting", str(exc), parent=self)
+            return
         self._run_single_post(post, options)
 
     def _make_render_options(self, output_path: Path) -> RenderOptions:
-        if self.quality_var.get() == "Draft":
-            width, height, preset = 540, 960, "ultrafast"
+        quality_profiles = {
+            "Data saver": (360, 640, "ultrafast", "650k", "96k"),
+            "Draft": (540, 960, "ultrafast", "1400k", "128k"),
+            "HD": (720, 1280, "fast", "3500k", "160k"),
+            "Full HD": (1080, 1920, "medium", "8000k", "192k"),
+        }
+        quality = self.quality_var.get()
+        width, height, preset, video_bitrate, audio_bitrate = quality_profiles.get(quality, quality_profiles["Full HD"])
+        if self.split_video_var.get():
+            try:
+                chunk_seconds = int(self.chunk_seconds_entry.get().strip())
+            except ValueError as exc:
+                raise ValueError("Chunk length must be a whole number of seconds.") from exc
+            if not 15 <= chunk_seconds <= 3600:
+                raise ValueError("Chunk length must be between 15 and 3600 seconds.")
+            self.preferences.part_length = f"{chunk_seconds} seconds"
         else:
-            width, height, preset = 1080, 1920, "medium"
+            self.preferences.part_length = "Full story"
+        self.preferences.video_quality = quality
         save_preferences(self.preferences)
         return RenderOptions(
             output_path=output_path,
@@ -1263,6 +1774,9 @@ class AutoTokApp(ctk.CTk):
             part_seconds=self.preferences.part_seconds,
             profanity_mode=self.preferences.profanity_mode,
             voice_speed=self.preferences.voice_speed,
+            video_speed=self.preferences.video_speed,
+            video_bitrate=video_bitrate,
+            audio_bitrate=audio_bitrate,
             auto_music=self.preferences.auto_music,
             music_volume=self.preferences.music_volume,
             auto_pick_background=self.auto_video_var.get(),
@@ -1283,6 +1797,17 @@ class AutoTokApp(ctk.CTk):
             category = self.preferences.video_category if self.preferences.video_category in categories else "All"
             self.category_var.set(category)
             self._toggle_auto_video()
+        if hasattr(self, "quality_var"):
+            self.quality_var.set(self.preferences.video_quality)
+        if hasattr(self, "video_speed_slider"):
+            self.video_speed_slider.set(self.preferences.video_speed)
+            self._video_speed_changed(self.preferences.video_speed)
+        if hasattr(self, "split_video_var"):
+            self.split_video_var.set(self.preferences.split_enabled)
+            self.chunk_seconds_entry.configure(state="normal")
+            self.chunk_seconds_entry.delete(0, "end")
+            self.chunk_seconds_entry.insert(0, str(self.preferences.part_seconds or 90))
+            self._split_changed()
 
     def _open_publish(self, outputs: list[Path]) -> None:
         existing = [Path(path) for path in outputs if Path(path).exists()]
@@ -1339,7 +1864,11 @@ class AutoTokApp(ctk.CTk):
             ListDialog(self, "queue")
             return
         posts = self.render_queue.copy()
-        template = self._make_render_options(self.output_path)
+        try:
+            template = self._make_render_options(self.output_path)
+        except ValueError as exc:
+            messagebox.showerror("Invalid export setting", str(exc), parent=self)
+            return
         self._set_busy(True, f"Rendering queue: 0/{len(posts)}")
         self._log(f"Starting batch of {len(posts)} stories")
 
@@ -1440,6 +1969,35 @@ class AutoTokApp(ctk.CTk):
                     if self.preferences.desktop_notifications:
                         notify_desktop("AutoTok upload failed", error)
                     messagebox.showerror("Upload failed", error, parent=self)
+                elif kind == "update_available":
+                    info: UpdateInfo = event[1]
+                    self.update_button.configure(state="normal", text=f"UPDATE {info.version}")
+                    existing = getattr(self, "whats_new_dialog", None)
+                    if not existing or not existing.winfo_exists():
+                        self.whats_new_dialog = WhatsNewDialog(self, info)
+                elif kind == "update_none":
+                    manual = event[1]
+                    self.update_button.configure(state="normal", text="UP TO DATE")
+                    if manual:
+                        messagebox.showinfo("No update available", "You already have the latest AutoTok release.", parent=self)
+                elif kind == "update_error":
+                    error, manual = event[1], event[2]
+                    self.update_button.configure(state="normal", text="CHECK UPDATE")
+                    if manual:
+                        messagebox.showerror("Update check failed", error, parent=self)
+                elif kind == "update_downloaded":
+                    archive = event[1]
+                    try:
+                        stage_and_launch_update(archive)
+                    except Exception as exc:
+                        self.update_button.configure(state="normal", text="CHECK UPDATE")
+                        messagebox.showerror("Update install failed", str(exc), parent=self)
+                    else:
+                        self._log("Update ready; restarting AutoTok")
+                        self.destroy()
+                elif kind == "update_download_error":
+                    self.update_button.configure(state="normal", text="CHECK UPDATE")
+                    messagebox.showerror("Update download failed", event[1], parent=self)
                 elif kind == "log":
                     self._log(event[1])
                 elif kind == "error":
@@ -1462,7 +2020,38 @@ class AutoTokApp(ctk.CTk):
         self.log_box.configure(state="disabled")
 
     def _open_settings(self) -> None:
-        SettingsDialog(self, self.tts_config)
+        SettingsDialog(self, self.tts_config, "Video")
+
+    def _check_for_updates(self, manual: bool = False) -> None:
+        if self.busy:
+            return
+        self.update_button.configure(state="disabled", text="CHECKING…")
+
+        def worker() -> None:
+            try:
+                info = check_for_update()
+                self.events.put(("update_available", info)) if info else self.events.put(("update_none", manual))
+            except Exception as exc:
+                self.events.put(("update_error", str(exc), manual))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _download_and_install_update(self, info: UpdateInfo) -> None:
+        self.update_button.configure(state="disabled", text="DOWNLOADING…")
+        self._log(f"Downloading AutoTok {info.version} from GitHub")
+
+        def progress(received: int, total: int) -> None:
+            if total > 0:
+                self.events.put(("progress", received / total, f"Downloading update • {received * 100 // total}%"))
+
+        def worker() -> None:
+            try:
+                archive = download_update(info, progress)
+                self.events.put(("update_downloaded", archive))
+            except Exception as exc:
+                self.events.put(("update_download_error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _open_output_folder(self) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,3 +1,3 @@
 """AutoTok desktop story-video maker."""
 
-__version__ = "1.0.2"
+__version__ = "1.2.1"
