@@ -1,0 +1,34 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+config.ini
+output/
+work/
+.autotok/
+preferences.json
+TK_cookies_*.json
+pyinstaller-build.*.log
+AutoTok-Windows-*.zip
+
+# Local media libraries (the empty folders are kept with .gitkeep)
+videos/*
+!videos/.gitkeep
+music/*
+!music/.gitkeep
+
+# Packaging and test artefacts
+build/
+dist/
+*.spec
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
