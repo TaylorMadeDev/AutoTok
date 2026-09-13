@@ -13,6 +13,7 @@ PREFERENCES_PATH = APP_DIR / "preferences.json"
 @dataclass(slots=True)
 class AppPreferences:
     caption_style: str = "Karaoke"
+    caption_words: int = 6
     caption_position: float = 0.66
     part_length: str = "90 seconds"
     align_captions: bool = True

@@ -93,6 +93,14 @@ class AdvancedSettingsDialog(ctk.CTkToplevel):
         body.pack(fill="both", expand=True, padx=26, pady=(0, 14))
 
         self.caption_style = self._option(body, "CAPTION STYLE", ["Karaoke", "Purple Pop", "Classic"], prefs.caption_style)
+        self.caption_words_label = self._slider_label(body, "WORDS PER CAPTION", prefs.caption_words, " words")
+        self.caption_words = ctk.CTkSlider(
+            body, from_=3, to=10, number_of_steps=7, progress_color=COLORS["accent"],
+            button_color=COLORS["accent"],
+            command=lambda value: self.caption_words_label.configure(text=f"WORDS PER CAPTION  •  {value:.0f} words"),
+        )
+        self.caption_words.set(prefs.caption_words)
+        self.caption_words.pack(fill="x", padx=18, pady=(0, 4))
         self.part_length = self._option(body, "AUTOMATIC PART LENGTH", ["60 seconds", "90 seconds", "3 minutes", "Full story"], prefs.part_length)
         self.profanity = self._option(body, "PROFANITY MODE", ["Uncensored", "Softened", "Platform-safe"], prefs.profanity_mode)
         self.whisper_model = self._option(body, "WHISPER ALIGNMENT MODEL", ["tiny.en", "base.en", "small.en"], prefs.whisper_model)
@@ -155,6 +163,7 @@ class AdvancedSettingsDialog(ctk.CTkToplevel):
     def _save(self) -> None:
         prefs = self.master_app.preferences
         prefs.caption_style = self.caption_style.get()
+        prefs.caption_words = int(round(self.caption_words.get()))
         prefs.part_length = self.part_length.get()
         prefs.profanity_mode = self.profanity.get()
         prefs.whisper_model = self.whisper_model.get()
@@ -234,8 +243,9 @@ class PreviewDialog(ctk.CTkToplevel):
         self.master_app.preferences.caption_position = round(self.slider.get(), 3)
         self.master_app.preferences.caption_style = self.style_var.get()
         save_preferences(self.master_app.preferences)
-        self.master_app.position_slider.set(self.master_app.preferences.caption_position)
-        self.master_app._caption_position_changed(self.master_app.preferences.caption_position)
+        if hasattr(self.master_app, "position_slider"):
+            self.master_app.position_slider.set(self.master_app.preferences.caption_position)
+            self.master_app._caption_position_changed(self.master_app.preferences.caption_position)
         self.destroy()
 
 
@@ -883,7 +893,7 @@ class AutoTokApp(ctk.CTk):
         ctk.CTkLabel(block, text=subtitle, text_color=COLORS["muted"], font=ctk.CTkFont(size=11)).pack(anchor="w")
 
     def _build_source_panel(self) -> None:
-        panel = ctk.CTkScrollableFrame(self, width=270, corner_radius=0, fg_color=COLORS["panel"])
+        panel = ctk.CTkScrollableFrame(self, width=244, corner_radius=0, fg_color=COLORS["panel"])
         panel.grid(row=1, column=0, sticky="nsew")
 
         self._section_title(panel, "1", "Find a story", "Pull a text post from Reddit")
@@ -904,7 +914,7 @@ class AutoTokApp(ctk.CTk):
         self.fetch_button.pack(fill="x", padx=20)
         self.queue_five_button = ctk.CTkButton(panel, text="＋  Queue 5 stories", height=34, fg_color="transparent", hover_color=COLORS["panel_2"], command=self._fetch_five_stories)
         self.queue_five_button.pack(fill="x", padx=20, pady=(6, 0))
-        ctk.CTkLabel(panel, text="Try: TIFU, TrueOffMyChest,\nPettyRevenge, AmItheAsshole", justify="left", text_color=COLORS["muted"], font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=9)
+        ctk.CTkLabel(panel, text="Try: TIFU · TrueOffMyChest · PettyRevenge", justify="left", text_color=COLORS["muted"], font=ctk.CTkFont(size=10), wraplength=210).pack(anchor="w", padx=20, pady=8)
 
         divider = ctk.CTkFrame(panel, height=1, fg_color=COLORS["border"])
         divider.pack(fill="x", padx=20, pady=8)
@@ -942,19 +952,8 @@ class AutoTokApp(ctk.CTk):
         self.footage_label.pack(anchor="w", padx=20, pady=7)
         self._toggle_auto_video()
 
-        ctk.CTkFrame(panel, height=1, fg_color=COLORS["border"]).pack(fill="x", padx=20, pady=8)
-        self._section_title(panel, "3", "Caption style", "Fast, readable TikTok text")
-        self.words_label = ctk.CTkLabel(panel, text="6 words per caption", text_color=COLORS["text"], font=ctk.CTkFont(size=12, weight="bold"))
-        self.words_label.pack(anchor="w", padx=20)
-        self.words_slider = ctk.CTkSlider(panel, from_=3, to=10, number_of_steps=7, progress_color=COLORS["accent"], button_color=COLORS["accent"], command=self._caption_words_changed)
-        self.words_slider.set(6)
-        self.words_slider.pack(fill="x", padx=20, pady=(8, 10))
-        self.position_label = ctk.CTkLabel(panel, text="", text_color=COLORS["text"], font=ctk.CTkFont(size=11, weight="bold"))
-        self.position_label.pack(anchor="w", padx=20)
-        self.position_slider = ctk.CTkSlider(panel, from_=0.35, to=0.76, number_of_steps=41, progress_color=COLORS["accent"], button_color=COLORS["accent"], command=self._caption_position_changed)
-        self.position_slider.set(self.preferences.caption_position)
-        self.position_slider.pack(fill="x", padx=20, pady=(6, 10))
-        self._caption_position_changed(self.preferences.caption_position)
+        # Caption layout, timing, presets, music, and voice controls live in
+        # the Studio dialog so the main screen stays focused on the edit.
 
     def _build_editor(self) -> None:
         center = ctk.CTkFrame(self, fg_color=COLORS["window"], corner_radius=0)
@@ -983,7 +982,7 @@ class AutoTokApp(ctk.CTk):
         self._update_word_count()
 
     def _build_render_panel(self) -> None:
-        panel = ctk.CTkFrame(self, width=310, corner_radius=0, fg_color=COLORS["panel"])
+        panel = ctk.CTkFrame(self, width=288, corner_radius=0, fg_color=COLORS["panel"])
         panel.grid(row=1, column=2, sticky="nsew")
         panel.grid_propagate(False)
         ctk.CTkLabel(panel, text="Export", text_color=COLORS["text"], font=ctk.CTkFont(size=23, weight="bold")).pack(anchor="w", padx=22, pady=(24, 4))
@@ -1023,8 +1022,8 @@ class AutoTokApp(ctk.CTk):
         self.status_label.pack(anchor="w", padx=20)
 
         ctk.CTkLabel(panel, text="ACTIVITY", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=22, pady=(24, 7))
-        self.log_box = ctk.CTkTextbox(panel, height=210, fg_color=COLORS["window"], border_width=0, corner_radius=10, text_color=COLORS["muted"], font=ctk.CTkFont(family="Consolas", size=11), activate_scrollbars=True)
-        self.log_box.pack(fill="both", expand=True, padx=20, pady=(0, 14))
+        self.log_box = ctk.CTkTextbox(panel, height=130, fg_color=COLORS["window"], border_width=0, corner_radius=10, text_color=COLORS["muted"], font=ctk.CTkFont(family="Consolas", size=11), activate_scrollbars=True)
+        self.log_box.pack(fill="both", expand=True, padx=20, pady=(0, 10))
         self._log("AutoTok Studio ready")
         if self.tts_config.configured:
             self._log("Flux voice configuration found (not yet validated)")
@@ -1032,11 +1031,13 @@ class AutoTokApp(ctk.CTk):
             self._log("No API key; Windows voice fallback enabled")
 
         self.open_output_button = ctk.CTkButton(panel, text="Open output folder", height=36, fg_color="transparent", hover_color=COLORS["panel_2"], command=self._open_output_folder)
-        self.open_output_button.pack(fill="x", padx=20, pady=(0, 18))
+        self.open_output_button.pack(fill="x", padx=20, pady=(0, 14))
 
     def _caption_words_changed(self, value: float) -> None:
         words = int(round(value))
-        self.words_label.configure(text=f"{words} words per caption")
+        self.preferences.caption_words = words
+        if hasattr(self, "words_label"):
+            self.words_label.configure(text=f"{words} words per caption")
 
     def _caption_position_changed(self, value: float) -> None:
         self.preferences.caption_position = float(value)
@@ -1254,7 +1255,7 @@ class AutoTokApp(ctk.CTk):
             output_path=output_path,
             background_files=self.background_files.copy() if not self.auto_video_var.get() else [],
             width=width, height=height, preset=preset,
-            caption_words=int(round(self.words_slider.get())),
+            caption_words=self.preferences.caption_words,
             caption_position=self.preferences.caption_position,
             caption_style=self.preferences.caption_style,
             align_captions=self.preferences.align_captions,
