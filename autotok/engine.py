@@ -9,6 +9,7 @@ import json
 import shutil
 import subprocess
 import wave
+from urllib.parse import quote
 from xml.sax.saxutils import escape
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -56,8 +57,11 @@ from .text_processing import (
 
 
 OPENROUTER_TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
+ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
 TTS_CACHE_DIR = APP_DIR / ".autotok" / "tts"
 ProgressCallback = Callable[[float, str], None]
+_KEY_ROTATION_CURSOR: dict[tuple[str, tuple[str, ...]], int] = {}
+_KEY_LIMIT_STATUS_CODES = {401, 402, 403, 429}
 
 
 def spoken_subreddit_name(subreddit: str) -> str:
@@ -278,6 +282,91 @@ def _windows_sapi(text: str, output_path: Path) -> Path:
     return output_path
 
 
+def _provider_label(provider: str, cached: bool = False) -> str:
+    labels = {"flux": "OpenRouter Flux", "azure": "Azure Speech", "elevenlabs": "ElevenLabs"}
+    label = labels.get(provider, "OpenRouter Flux")
+    return f"{label} (cached)" if cached else label
+
+
+def _key_candidates(config: OpenRouterConfig) -> list[str]:
+    keys = list(config.keys_for_provider())
+    mode = config.key_mode_for_provider()
+    if len(keys) < 2 or mode == "single":
+        return keys[:1]
+    if mode == "random":
+        random.shuffle(keys)
+        return keys
+    cursor_key = (config.provider, tuple(keys))
+    start = _KEY_ROTATION_CURSOR.get(cursor_key, 0) % len(keys)
+    return keys[start:] + keys[:start]
+
+
+def _advance_rotation(config: OpenRouterConfig, exhausted_key: str) -> None:
+    if config.key_mode_for_provider() != "rotate":
+        return
+    keys = list(config.keys_for_provider())
+    if exhausted_key in keys:
+        _KEY_ROTATION_CURSOR[(config.provider, tuple(keys))] = (keys.index(exhausted_key) + 1) % len(keys)
+
+
+def _request_tts(text: str, config: OpenRouterConfig, speed: float, api_key: str):
+    if config.provider == "azure":
+        rate = int(round((max(0.5, min(1.5, speed)) - 1.0) * 100))
+        ssml = (
+            "<speak version='1.0' xml:lang='en-US'>"
+            f"<voice name='{escape(config.azure_voice)}'><prosody rate='{rate:+d}%'>"
+            f"{escape(text)}</prosody></voice></speak>"
+        )
+        return requests.post(
+            f"https://{config.azure_region}.tts.speech.microsoft.com/cognitiveservices/v1",
+            headers={
+                "Ocp-Apim-Subscription-Key": api_key,
+                "Content-Type": "application/ssml+xml",
+                "X-Microsoft-OutputFormat": "audio-24khz-96kbitrate-mono-mp3",
+                "User-Agent": "AutoTok Story Studio",
+            },
+            data=ssml.encode("utf-8"), timeout=(30, 600),
+        )
+    if config.provider == "elevenlabs":
+        return requests.post(
+            f"{ELEVENLABS_TTS_URL}/{quote(config.elevenlabs_voice, safe='')}",
+            params={"output_format": "mp3_44100_128"},
+            headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+            json={
+                "text": text,
+                "model_id": config.elevenlabs_model,
+                "voice_settings": {"speed": max(0.7, min(1.2, speed))},
+            },
+            timeout=(30, 600),
+        )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-OpenRouter-Title": "AutoTok Story Studio",
+    }
+    if config.http_referer:
+        headers["HTTP-Referer"] = config.http_referer
+    return requests.post(
+        OPENROUTER_TTS_URL,
+        headers=headers,
+        json={
+            "model": config.model,
+            "input": text,
+            "voice": config.voice,
+            "response_format": "mp3",
+            "speed": max(0.5, min(1.5, speed)),
+        },
+        timeout=(30, 600),
+    )
+
+
+def _response_error(response) -> object:
+    try:
+        return response.json()
+    except ValueError:
+        return response.text[:400]
+
+
 def synthesize_speech(
     text: str,
     config: OpenRouterConfig,
@@ -290,8 +379,14 @@ def synthesize_speech(
     TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_seed = json.dumps(
         {
-            "text": text, "provider": config.provider, "model": config.model,
-            "voice": config.azure_voice if config.provider == "azure" else config.voice,
+            "text": text,
+            "provider": config.provider,
+            "model": config.elevenlabs_model if config.provider == "elevenlabs" else config.model,
+            "voice": (
+                config.azure_voice if config.provider == "azure"
+                else config.elevenlabs_voice if config.provider == "elevenlabs"
+                else config.voice
+            ),
             "region": config.azure_region if config.provider == "azure" else "",
             "speed": round(speed, 2),
         },
@@ -301,60 +396,23 @@ def synthesize_speech(
     flux_cache = TTS_CACHE_DIR / f"{cache_id}.mp3"
     if config.configured:
         if flux_cache.exists() and flux_cache.stat().st_size > 100:
-            cached_label = "Azure Speech (cached)" if config.provider == "azure" else "OpenRouter Flux (cached)"
-            return flux_cache, cached_label
-        target = output_stem.with_suffix(".mp3")
+            return flux_cache, _provider_label(config.provider, cached=True)
         try:
-            if config.provider == "azure":
-                rate = int(round((max(0.5, min(1.5, speed)) - 1.0) * 100))
-                ssml = (
-                    "<speak version='1.0' xml:lang='en-US'>"
-                    f"<voice name='{escape(config.azure_voice)}'><prosody rate='{rate:+d}%'>"
-                    f"{escape(text)}</prosody></voice></speak>"
-                )
-                response = requests.post(
-                    f"https://{config.azure_region}.tts.speech.microsoft.com/cognitiveservices/v1",
-                    headers={
-                        "Ocp-Apim-Subscription-Key": config.azure_key,
-                        "Content-Type": "application/ssml+xml",
-                        "X-Microsoft-OutputFormat": "audio-24khz-96kbitrate-mono-mp3",
-                        "User-Agent": "AutoTok Story Studio",
-                    },
-                    data=ssml.encode("utf-8"), timeout=(30, 600),
-                )
-                provider_label = "Azure Speech"
-            else:
-                headers = {
-                    "Authorization": f"Bearer {config.api_key}",
-                    "Content-Type": "application/json",
-                    "X-OpenRouter-Title": "AutoTok Story Studio",
-                }
-                if config.http_referer:
-                    headers["HTTP-Referer"] = config.http_referer
-                response = requests.post(
-                    OPENROUTER_TTS_URL,
-                    headers=headers,
-                    json={
-                        "model": config.model,
-                        "input": text,
-                        "voice": config.voice,
-                        "response_format": "mp3",
-                        "speed": max(0.5, min(1.5, speed)),
-                    },
-                    timeout=(30, 600),
-                )
-                provider_label = "OpenRouter Flux"
-            if not response.ok:
-                try:
-                    detail = response.json()
-                except ValueError:
-                    detail = response.text[:400]
-                provider = "Azure Speech" if config.provider == "azure" else "OpenRouter"
-                raise RuntimeError(f"{provider} HTTP {response.status_code}: {detail}")
-            if len(response.content) < 100:
-                raise RuntimeError(f"{provider_label} returned an empty audio file.")
-            flux_cache.write_bytes(response.content)
-            return flux_cache, provider_label
+            provider_label = _provider_label(config.provider)
+            candidates = _key_candidates(config)
+            for index, api_key in enumerate(candidates):
+                response = _request_tts(text, config, speed, api_key)
+                if response.ok:
+                    if len(response.content) < 100:
+                        raise RuntimeError(f"{provider_label} returned an empty audio file.")
+                    flux_cache.write_bytes(response.content)
+                    return flux_cache, provider_label
+                error = RuntimeError(f"{provider_label} HTTP {response.status_code}: {_response_error(response)}")
+                can_retry = response.status_code in _KEY_LIMIT_STATUS_CODES and index + 1 < len(candidates)
+                if not can_retry:
+                    raise error
+                _advance_rotation(config, api_key)
+            raise RuntimeError(f"{provider_label} could not generate speech with the configured keys.")
         except Exception as openrouter_error:
             if not allow_local_fallback:
                 raise
@@ -362,7 +420,7 @@ def synthesize_speech(
                 fallback_notice(str(openrouter_error))
 
     if not allow_local_fallback:
-        raise RuntimeError("Add an OpenRouter API key before rendering.")
+        raise RuntimeError(f"Add a {_provider_label(config.provider)} API key before rendering.")
     windows_id = hashlib.sha256(("windows:" + text).encode("utf-8")).hexdigest()
     windows_cache = TTS_CACHE_DIR / f"{windows_id}.wav"
     if not windows_cache.exists() or windows_cache.stat().st_size < 100:
@@ -393,7 +451,7 @@ def synthesize_speech_parts(
             active_config,
             work_dir / f"story_{index:03d}",
             fallback_notice=lambda reason, value=progress_value: _notify(
-                progress, value, f"Flux failed: {reason} — using Windows voice"
+                progress, value, f"Cloud voice failed: {reason} — using Windows voice"
             ),
             speed=speed,
         )

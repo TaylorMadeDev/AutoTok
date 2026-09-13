@@ -12,12 +12,16 @@ button, while **Review & Publish** appears only after a successful render.
 
 The header's Font Awesome **Settings** button opens one tabbed window for
 Video, Captions, Audio & Voice, Publishing, and Updates. Changes across every
-page are committed together with **Save all settings**.
+page are committed together with **Save all settings**. The main window shows
+the installed version in its bottom-left corner.
 
-**Open Video Harvester** uses the preset YouTube playlist and works through it
-one video at a time. It downloads a video at up to 1080p, cuts it into
-sequential one-minute MP4 clips under `videos\Harvested`, and only then starts
-the next playlist item. Use it only for footage you have permission to reuse.
+**Open Video Harvester** has separate **Custom** and **Built In** tabs. Custom
+accepts YouTube video or playlist links; Built In offers Minecraft, Subway
+Surfers, and ASMR, with Minecraft available now and the others marked coming
+soon. Choose 1–25 source videos, a 10–180 second clip length (60 seconds by
+default), and whether the harvested clips keep their sound. AutoTok fully
+downloads and cuts one video before starting the next. Use it only for footage
+you have permission to reuse.
 
 New production and publishing tools include:
 
@@ -119,7 +123,7 @@ release. To build locally, install the source requirements plus PyInstaller,
 then package `app.py` as a one-directory Windows application. The release ZIP
 must keep `AutoTok.exe` and `_internal` together after extraction.
 
-## AI voice: OpenRouter Flux or Azure Speech
+## AI voice: OpenRouter Flux, Azure Speech, or ElevenLabs
 
 On first launch, AutoTok checks:
 
@@ -136,6 +140,17 @@ a short live synthesis request and plays the returned audio before allowing the
 setup to continue. Azure keys are region-scoped, so a key and region from
 different resources will fail the test.
 
+ElevenLabs uses an API key, voice ID, and model such as
+`eleven_multilingual_v2`. Its text-to-speech endpoint returns MP3 narration and
+supports AutoTok's voice-speed setting.
+
+Each cloud provider accepts multiple comma-separated API keys. **Use one key**
+always uses the first key. **Auto rotate keys** keeps using a key until the
+service reports a key, quota, or rate limit and then moves to the next.
+**Random key each request** shuffles the key choice for every narration request.
+All key lists are stored in Windows Credential Manager, and existing single-key
+configurations migrate automatically.
+
 If OpenRouter rejects the key or TTS request, AutoTok logs the exact service
 error and continues with the Windows voice so a render is not lost.
 
@@ -146,15 +161,23 @@ The expected configuration is:
 provider = flux
 
 [openrouter]
-api_key = your-key-here
+api_keys = __windows_credential_manager__
+key_mode = rotate
 model = deepgram/flux-tts:free
 voice = flux-wes-en
 http_referer =
 
 [azure_speech]
-api_key =
+api_keys =
+key_mode = single
 region = uksouth
 voice = en-GB-SoniaNeural
+
+[elevenlabs]
+api_keys =
+key_mode = random
+voice = JBFqnCBsd6RMkjVDRZzb
+model = eleven_multilingual_v2
 ```
 
 `config.ini` is intentionally ignored by Git.

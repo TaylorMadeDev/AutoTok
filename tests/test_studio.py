@@ -14,13 +14,59 @@ from autotok.studio import (
     generate_hook_variants,
     story_fingerprint,
 )
-from autotok.config import OpenRouterConfig
-from autotok.engine import synthesize_speech
+from autotok.config import OpenRouterConfig, _read, parse_api_keys, save_openrouter_config
+from autotok.engine import _KEY_ROTATION_CURSOR, _key_candidates, synthesize_speech
 from autotok.voices import DEFAULT_FLUX_VOICE, FLUX_VOICES, valid_flux_voice
 from autotok.updater import _safe_extract, is_newer_version
 
 
 class StudioTests(unittest.TestCase):
+    def test_multiple_api_keys_are_deduplicated_and_preserve_order(self) -> None:
+        self.assertEqual(parse_api_keys("first, second\nfirst; third"), ("first", "second", "third"))
+        config = OpenRouterConfig(api_key="legacy", api_keys=("new", "legacy"), api_key_mode="auto rotate")
+        self.assertEqual(config.api_keys, ("new", "legacy"))
+        self.assertEqual(config.api_key, "new")
+        self.assertEqual(config.api_key_mode, "rotate")
+
+    def test_single_and_random_key_modes_choose_expected_candidates(self) -> None:
+        single = OpenRouterConfig(api_keys=("one", "two"), api_key_mode="single")
+        random_config = OpenRouterConfig(api_keys=("one", "two", "three"), api_key_mode="random")
+        self.assertEqual(_key_candidates(single), ["one"])
+        with patch("autotok.engine.random.shuffle", side_effect=lambda items: items.reverse()):
+            self.assertEqual(_key_candidates(random_config), ["three", "two", "one"])
+
+    def test_provider_key_lists_are_stored_in_keyring(self) -> None:
+        class FakeKeyring:
+            values: dict[tuple[str, str], str] = {}
+
+            @classmethod
+            def set_password(cls, service, username, value):
+                cls.values[(service, username)] = value
+
+            @classmethod
+            def get_password(cls, service, username):
+                return cls.values.get((service, username))
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "config.ini"
+            config = OpenRouterConfig(
+                provider="elevenlabs",
+                api_keys=("or-one", "or-two"), api_key_mode="random",
+                azure_keys=("az-one", "az-two"), azure_key_mode="rotate",
+                elevenlabs_keys=("el-one", "el-two"), elevenlabs_key_mode="rotate",
+            )
+            with patch("autotok.config.CONFIG_PATH", path), patch("autotok.config.keyring", FakeKeyring):
+                save_openrouter_config(config)
+                saved = path.read_text(encoding="utf-8")
+                loaded = _read(path)
+            self.assertNotIn("or-one", saved)
+            self.assertNotIn("az-one", saved)
+            self.assertNotIn("el-one", saved)
+            self.assertEqual(loaded.api_keys, ("or-one", "or-two"))
+            self.assertEqual(loaded.azure_keys, ("az-one", "az-two"))
+            self.assertEqual(loaded.elevenlabs_keys, ("el-one", "el-two"))
+            self.assertEqual(loaded.elevenlabs_key_mode, "rotate")
+
     def test_complete_flux_voice_catalog_includes_wes_default(self) -> None:
         self.assertEqual(len(FLUX_VOICES), 36)
         self.assertIn("flux-wes-en", FLUX_VOICES)
@@ -99,6 +145,47 @@ class StudioTests(unittest.TestCase):
             self.assertTrue(path.exists())
             self.assertIn("uksouth.tts.speech.microsoft.com", post.call_args.args[0])
             self.assertIn(b"This &amp; that", post.call_args.kwargs["data"])
+
+    def test_elevenlabs_uses_voice_model_speed_and_api_key_header(self) -> None:
+        class Response:
+            ok = True
+            status_code = 200
+            content = b"ID3" + b"e" * 200
+
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "cache"
+            config = OpenRouterConfig(
+                provider="elevenlabs", elevenlabs_keys=("eleven-key",),
+                elevenlabs_voice="voice-123", elevenlabs_model="eleven_multilingual_v2",
+            )
+            with patch("autotok.engine.TTS_CACHE_DIR", cache), patch("autotok.engine.requests.post", return_value=Response()) as post:
+                path, label = synthesize_speech("ElevenLabs test", config, Path(folder) / "voice", allow_local_fallback=False, speed=1.1)
+            self.assertEqual(label, "ElevenLabs")
+            self.assertTrue(path.exists())
+            self.assertTrue(post.call_args.args[0].endswith("/voice-123"))
+            self.assertEqual(post.call_args.kwargs["headers"]["xi-api-key"], "eleven-key")
+            self.assertEqual(post.call_args.kwargs["json"]["model_id"], "eleven_multilingual_v2")
+            self.assertEqual(post.call_args.kwargs["json"]["voice_settings"]["speed"], 1.1)
+
+    def test_auto_rotate_moves_to_next_key_after_limit_response(self) -> None:
+        class Response:
+            def __init__(self, ok, status_code, content=b"", detail="limit"):
+                self.ok, self.status_code, self.content, self.text = ok, status_code, content, detail
+
+            def json(self):
+                return {"error": self.text}
+
+        config = OpenRouterConfig(api_keys=("first-key", "second-key"), api_key_mode="rotate")
+        limited = Response(False, 429)
+        success = Response(True, 200, b"ID3" + b"a" * 200)
+        _KEY_ROTATION_CURSOR.clear()
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "cache"
+            with patch("autotok.engine.TTS_CACHE_DIR", cache), patch("autotok.engine.requests.post", side_effect=[limited, success, success]) as post:
+                synthesize_speech("First request", config, Path(folder) / "one", allow_local_fallback=False)
+                synthesize_speech("Second request", config, Path(folder) / "two", allow_local_fallback=False)
+            used = [item.kwargs["headers"]["Authorization"] for item in post.call_args_list]
+        self.assertEqual(used, ["Bearer first-key", "Bearer second-key", "Bearer second-key"])
 
 
 if __name__ == "__main__":

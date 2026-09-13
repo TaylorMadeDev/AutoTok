@@ -56,7 +56,7 @@ class SetupWizard(ctk.CTk):
             "notifications": ctk.BooleanVar(value=True),
         }
         current = load_openrouter_config()
-        self.voice_provider = ctk.StringVar(value="Azure Speech" if current.provider == "azure" else "OpenRouter Flux")
+        self.voice_provider = ctk.StringVar(value={"azure": "Azure Speech", "elevenlabs": "ElevenLabs"}.get(current.provider, "OpenRouter Flux"))
         self.skip_voice = ctk.BooleanVar(value=False)
         self.account = ctk.StringVar(value=load_preferences().tiktok_account)
 
@@ -202,8 +202,8 @@ class SetupWizard(ctk.CTk):
     def _show_provider(self) -> None:
         self.page = "provider"
         body = self._heading("Choose your AI voice", "You can switch later from the green voice badge inside AutoTok.")
-        ctk.CTkSegmentedButton(body, values=["OpenRouter Flux", "Azure Speech"], variable=self.voice_provider, selected_color=COLORS["accent"], selected_hover_color=COLORS["accent_hover"]).pack(fill="x", padx=18, pady=(22, 12))
-        ctk.CTkLabel(body, text="OPENROUTER FLUX\nEasy to reuse from AI Story. Uses deepgram/flux-tts through OpenRouter and automatically splits long stories into small requests.\n\nAZURE SPEECH\nUses an Azure Speech resource key and its matching region. Good voice selection and a direct regional speech endpoint.", justify="left", wraplength=520, text_color=COLORS["muted"]).pack(anchor="w", padx=18, pady=12)
+        ctk.CTkSegmentedButton(body, values=["OpenRouter Flux", "Azure Speech", "ElevenLabs"], variable=self.voice_provider, selected_color=COLORS["accent"], selected_hover_color=COLORS["accent_hover"]).pack(fill="x", padx=18, pady=(22, 12))
+        ctk.CTkLabel(body, text="OPENROUTER FLUX\nUses deepgram/flux-tts through OpenRouter.\n\nAZURE SPEECH\nUses an Azure Speech resource key and regional endpoint.\n\nELEVENLABS\nUses an ElevenLabs API key, voice ID, and speech model.", justify="left", wraplength=520, text_color=COLORS["muted"]).pack(anchor="w", padx=18, pady=12)
         self.next_button.configure(text="Configure voice", state="normal")
 
     def _show_voice(self) -> None:
@@ -218,11 +218,16 @@ class SetupWizard(ctk.CTk):
             self._field(body, "MODEL", current.model or "deepgram/flux-tts:free", "model")
             self._voice_dropdown(body, valid_flux_voice(current.voice))
             ctk.CTkButton(body, text="Get an OpenRouter key", fg_color=COLORS["panel_2"], command=lambda: webbrowser.open("https://openrouter.ai/settings/keys")).pack(anchor="w", padx=18, pady=8)
-        else:
+        elif provider == "Azure Speech":
             self._field(body, "AZURE SPEECH KEY", current.azure_key, "key", show="•")
             self._field(body, "RESOURCE REGION", current.azure_region or "uksouth", "region")
             self._field(body, "NEURAL VOICE", current.azure_voice or "en-GB-SoniaNeural", "voice")
             ctk.CTkButton(body, text="Open Azure Speech setup", fg_color=COLORS["panel_2"], command=lambda: webbrowser.open("https://portal.azure.com/#create/Microsoft.CognitiveServicesSpeechServices")).pack(anchor="w", padx=18, pady=8)
+        else:
+            self._field(body, "ELEVENLABS API KEY", current.elevenlabs_key, "key", show="•")
+            self._field(body, "VOICE ID", current.elevenlabs_voice or "JBFqnCBsd6RMkjVDRZzb", "voice")
+            self._field(body, "MODEL", current.elevenlabs_model or "eleven_multilingual_v2", "model")
+            ctk.CTkButton(body, text="Get an ElevenLabs key", fg_color=COLORS["panel_2"], command=lambda: webbrowser.open("https://elevenlabs.io/app/settings/api-keys")).pack(anchor="w", padx=18, pady=8)
         self.voice_status = ctk.CTkLabel(body, text="Not tested yet", text_color=COLORS["muted"], wraplength=520)
         self.voice_status.pack(anchor="w", padx=18, pady=(10, 5))
         ctk.CTkButton(body, text="Test API and play sample", fg_color=COLORS["accent"], command=self._test_voice).pack(anchor="w", padx=18, pady=(4, 18))
@@ -251,15 +256,33 @@ class SetupWizard(ctk.CTk):
         current = load_openrouter_config()
         if self.voice_provider.get() == "Azure Speech":
             return OpenRouterConfig(
-                provider="azure", api_key=current.api_key, model=current.model, voice=current.voice,
-                azure_key=self.voice_fields["key"].get().strip(),
+                provider="azure", api_keys=current.api_keys, api_key_mode=current.api_key_mode,
+                model=current.model, voice=current.voice,
+                azure_key=self.voice_fields["key"].get().strip(), azure_key_mode=current.azure_key_mode,
                 azure_region=self.voice_fields["region"].get().strip(),
                 azure_voice=self.voice_fields["voice"].get().strip(),
+                elevenlabs_keys=current.elevenlabs_keys, elevenlabs_key_mode=current.elevenlabs_key_mode,
+                elevenlabs_voice=current.elevenlabs_voice, elevenlabs_model=current.elevenlabs_model,
+            )
+        if self.voice_provider.get() == "ElevenLabs":
+            return OpenRouterConfig(
+                provider="elevenlabs", api_keys=current.api_keys, api_key_mode=current.api_key_mode,
+                model=current.model, voice=current.voice,
+                azure_keys=current.azure_keys, azure_key_mode=current.azure_key_mode,
+                azure_region=current.azure_region, azure_voice=current.azure_voice,
+                elevenlabs_key=self.voice_fields["key"].get().strip(),
+                elevenlabs_key_mode=current.elevenlabs_key_mode,
+                elevenlabs_voice=self.voice_fields["voice"].get().strip(),
+                elevenlabs_model=self.voice_fields["model"].get().strip(),
             )
         return OpenRouterConfig(
             provider="flux", api_key=self.voice_fields["key"].get().strip(),
+            api_key_mode=current.api_key_mode,
             model=self.voice_fields["model"].get().strip(), voice=self.voice_fields["voice"].get().strip(),
-            azure_key=current.azure_key, azure_region=current.azure_region, azure_voice=current.azure_voice,
+            azure_keys=current.azure_keys, azure_key_mode=current.azure_key_mode,
+            azure_region=current.azure_region, azure_voice=current.azure_voice,
+            elevenlabs_keys=current.elevenlabs_keys, elevenlabs_key_mode=current.elevenlabs_key_mode,
+            elevenlabs_voice=current.elevenlabs_voice, elevenlabs_model=current.elevenlabs_model,
         )
 
     def _test_voice(self) -> None:
@@ -451,7 +474,7 @@ class SetupWizard(ctk.CTk):
             return
         if self.page == "voice":
             current = load_openrouter_config()
-            current.provider = "azure" if self.voice_provider.get() == "Azure Speech" else "flux"
+            current.provider = {"Azure Speech": "azure", "ElevenLabs": "elevenlabs"}.get(self.voice_provider.get(), "flux")
             save_openrouter_config(current)
             self.completed["voice"] = True
             self._show_tiktok()

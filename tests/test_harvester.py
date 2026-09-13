@@ -9,11 +9,13 @@ from moviepy.editor import ColorClip, VideoFileClip
 
 from autotok.harvester import (
     DEFAULT_HARVEST_PLAYLIST,
+    HARVEST_SOURCES,
     HarvestResult,
     _playlist_entry_url,
     _safe_name,
     _validate_url,
     harvest_playlist,
+    harvest_sources,
     split_video,
 )
 
@@ -25,6 +27,10 @@ class HarvesterTests(unittest.TestCase):
             _validate_url("not a url")
         self.assertEqual(_safe_name("My Clips / Racing!"), "My_Clips_Racing")
         self.assertIn("PLJVvekmbcMxBCh1Cb997PA2hsrxmxdB6G", DEFAULT_HARVEST_PLAYLIST)
+        self.assertEqual(list(HARVEST_SOURCES), ["Minecraft", "Subway Surfers", "ASMR"])
+        self.assertTrue(HARVEST_SOURCES["Minecraft"])
+        self.assertFalse(HARVEST_SOURCES["Subway Surfers"])
+        self.assertFalse(HARVEST_SOURCES["ASMR"])
 
     def test_playlist_entries_are_converted_to_video_urls(self) -> None:
         self.assertEqual(
@@ -57,6 +63,26 @@ class HarvesterTests(unittest.TestCase):
             ],
         )
 
+    @patch("autotok.harvester.harvest_urls")
+    @patch("autotok.harvester.playlist_video_urls")
+    def test_custom_sources_expand_playlists_and_respect_download_limit(self, playlist_urls, harvest_urls_mock) -> None:
+        playlist_urls.side_effect = [
+            ["https://example.com/1", "https://example.com/2"],
+            ["https://example.com/3"],
+        ]
+        harvest_urls_mock.return_value = []
+
+        harvest_sources(
+            ["https://example.com/playlist", "https://example.com/video"],
+            "Custom", 45, max_videos=2, include_audio=False,
+        )
+
+        playlist_urls.assert_called_once_with("https://example.com/playlist")
+        harvest_urls_mock.assert_called_once_with(
+            ["https://example.com/1", "https://example.com/2"],
+            "Custom", 45, None, False,
+        )
+
     def test_split_video_creates_sequential_segments(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -76,6 +102,22 @@ class HarvesterTests(unittest.TestCase):
                 finally:
                     rendered.close()
             self.assertTrue(all(0 < duration <= 1.2 for duration in durations))
+
+    def test_split_video_can_remove_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "source.mp4"
+            clip = ColorClip((64, 64), color=(20, 40, 60), duration=1.2)
+            try:
+                clip.write_videofile(str(source), fps=10, codec="libx264", audio=False, logger=None)
+            finally:
+                clip.close()
+            output = split_video(source, root / "silent", segment_seconds=1, include_audio=False)[0]
+            rendered = VideoFileClip(str(output))
+            try:
+                self.assertIsNone(rendered.audio)
+            finally:
+                rendered.close()
 
 
 if __name__ == "__main__":

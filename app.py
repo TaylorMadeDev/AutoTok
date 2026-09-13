@@ -22,15 +22,17 @@ try:
 except ImportError:
     fontawesomefree = None
 
+from autotok import __version__
 from autotok.config import (
     APP_DIR,
     OpenRouterConfig,
     load_openrouter_config,
     migrate_plaintext_secret,
+    parse_api_keys,
     save_openrouter_config,
 )
 from autotok.engine import RenderOptions, generate_preview_image, render_story_series, synthesize_speech
-from autotok.harvester import DEFAULT_HARVEST_PLAYLIST, HarvestResult, harvest_playlist
+from autotok.harvester import HARVEST_SOURCES, HarvestResult, harvest_sources
 from autotok.jobs import append_history, find_duplicate_story, load_history, load_queue, save_queue, seen_permalinks
 from autotok.library import MUSIC_DIR, VIDEO_DIR, scan_music, scan_videos, video_categories
 from autotok.preferences import AppPreferences, load_preferences, save_preferences
@@ -82,6 +84,16 @@ COLORS = {
 }
 
 VIDEO_LIBRARY_DIR = VIDEO_DIR
+KEY_MODE_LABELS = {
+    "single": "Use one key",
+    "rotate": "Auto rotate keys",
+    "random": "Random key each request",
+}
+KEY_MODE_VALUES = {label: mode for mode, label in KEY_MODE_LABELS.items()}
+
+
+def _provider_display_name(provider: str) -> str:
+    return {"flux": "OpenRouter Flux", "azure": "Azure Speech", "elevenlabs": "ElevenLabs"}.get(provider, "Cloud")
 
 FA_GLYPHS = {
     "settings": "\uf013", "video": "\uf03d", "captions": "\uf20a",
@@ -117,8 +129,8 @@ class VideoHarvesterDialog(ctk.CTkToplevel):
         super().__init__(master)
         self.master_app = master
         self.title("AutoTok Video Harvester")
-        self.geometry("760x690")
-        self.minsize(680, 610)
+        self.geometry("800x820")
+        self.minsize(720, 720)
         self.configure(fg_color=COLORS["window"])
         self.transient(master)
         self.grab_set()
@@ -132,20 +144,70 @@ class VideoHarvesterDialog(ctk.CTkToplevel):
         title = ctk.CTkFrame(heading, fg_color="transparent")
         title.pack(side="left")
         ctk.CTkLabel(title, text="Video Harvester", text_color=COLORS["text"], font=ctk.CTkFont(size=25, weight="bold")).pack(anchor="w")
-        ctk.CTkLabel(title, text="Harvest the preset playlist one video at a time.", text_color=COLORS["muted"]).pack(anchor="w")
+        ctk.CTkLabel(title, text="Choose footage, clip length, count, and sound.", text_color=COLORS["muted"]).pack(anchor="w")
 
         body = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=14, border_width=1, border_color=COLORS["border"])
         body.pack(fill="both", expand=True, padx=28, pady=(4, 14))
-        ctk.CTkLabel(body, text="PRESET YOUTUBE PLAYLIST", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=18, pady=(18, 6))
-        self.urls = ctk.CTkTextbox(body, height=92, fg_color=COLORS["window"], border_width=1, border_color=COLORS["border"], wrap="word")
-        self.urls.pack(fill="x", padx=18)
-        self.urls.insert("1.0", DEFAULT_HARVEST_PLAYLIST)
-        self.urls.configure(state="disabled")
+        ctk.CTkLabel(body, text="DOWNLOAD SOURCE", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=18, pady=(18, 6))
+        self.source_tabs = ctk.CTkTabview(
+            body, height=150, fg_color=COLORS["panel_2"],
+            segmented_button_selected_color=COLORS["accent"],
+            segmented_button_selected_hover_color=COLORS["accent_hover"],
+            command=self._source_tab_changed,
+        )
+        self.source_tabs.pack(fill="x", padx=18)
+        custom_tab = self.source_tabs.add("Custom")
+        built_in_tab = self.source_tabs.add("Built In")
+
+        ctk.CTkLabel(custom_tab, text="Paste one video or playlist URL per line", text_color=COLORS["muted"], anchor="w").pack(fill="x", padx=12, pady=(8, 5))
+        self.urls = ctk.CTkTextbox(
+            custom_tab, height=70, fg_color=COLORS["window"],
+            border_width=1, border_color=COLORS["border"], wrap="word",
+        )
+        self.urls.pack(fill="x", padx=12, pady=(0, 10))
+
+        ctk.CTkLabel(built_in_tab, text="BUILT-IN PLAYLIST", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=12, pady=(8, 5))
+        self.builtin_source = ctk.StringVar(value="Minecraft")
+        ctk.CTkOptionMenu(
+            built_in_tab, values=list(HARVEST_SOURCES), variable=self.builtin_source,
+            command=self._built_in_changed, fg_color=COLORS["window"],
+            button_color=COLORS["accent"], button_hover_color=COLORS["accent_hover"],
+        ).pack(fill="x", padx=12)
+        self.builtin_status = ctk.CTkLabel(
+            built_in_tab, text="Minecraft playlist is ready.",
+            text_color=COLORS["success"], anchor="w",
+        )
+        self.builtin_status.pack(fill="x", padx=12, pady=(7, 6))
+
         ctk.CTkLabel(body, text="LIBRARY CATEGORY", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=18, pady=(14, 6))
         self.category = ctk.CTkEntry(body, height=38, fg_color=COLORS["panel_2"], border_color=COLORS["border"])
-        self.category.insert(0, "Harvested")
+        self.category.insert(0, "Minecraft")
         self.category.pack(fill="x", padx=18)
-        ctk.CTkLabel(body, text="AutoTok finishes downloading and cutting each playlist video into sequential 60-second MP4 clips before moving to the next. Only harvest footage you have permission to use.", text_color=COLORS["muted"], justify="left", wraplength=650).pack(anchor="w", padx=18, pady=(12, 8))
+
+        self.segment_label = ctk.CTkLabel(body, text="CLIP LENGTH  •  60 seconds", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold"))
+        self.segment_label.pack(anchor="w", padx=18, pady=(14, 5))
+        self.segment_seconds = ctk.CTkSlider(
+            body, from_=10, to=180, number_of_steps=17, progress_color=COLORS["accent"],
+            command=lambda value: self.segment_label.configure(text=f"CLIP LENGTH  •  {int(round(value))} seconds"),
+        )
+        self.segment_seconds.set(60)
+        self.segment_seconds.pack(fill="x", padx=18)
+
+        self.count_label = ctk.CTkLabel(body, text="VIDEOS TO DOWNLOAD  •  5", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold"))
+        self.count_label.pack(anchor="w", padx=18, pady=(14, 5))
+        self.video_count = ctk.CTkSlider(
+            body, from_=1, to=25, number_of_steps=24, progress_color=COLORS["accent"],
+            command=lambda value: self.count_label.configure(text=f"VIDEOS TO DOWNLOAD  •  {int(round(value))}"),
+        )
+        self.video_count.set(5)
+        self.video_count.pack(fill="x", padx=18)
+
+        self.sound_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            body, text="Keep sound in harvested clips", variable=self.sound_var,
+            progress_color=COLORS["accent"],
+        ).pack(anchor="w", padx=18, pady=(14, 5))
+        ctk.CTkLabel(body, text="Playlists are limited to the selected video count. Each video is fully split before the next starts. Only harvest footage you have permission to use.", text_color=COLORS["muted"], justify="left", wraplength=690).pack(anchor="w", padx=18, pady=(6, 8))
         self.progress = ctk.CTkProgressBar(body, progress_color=COLORS["accent"], fg_color=COLORS["border"])
         self.progress.set(0)
         self.progress.pack(fill="x", padx=18, pady=(8, 5))
@@ -160,7 +222,29 @@ class VideoHarvesterDialog(ctk.CTkToplevel):
         ctk.CTkButton(actions, text="Open harvested clips", fg_color="transparent", border_width=1, border_color=COLORS["border"], command=self._open_folder).pack(side="left")
         self.harvest_button = ctk.CTkButton(actions, text="DOWNLOAD & CUT", image=fontawesome_icon("cut", 15), compound="left", width=170, fg_color=COLORS["accent"], command=self._start)
         self.harvest_button.pack(side="right")
+        self.source_tabs.set("Built In")
+        self._refresh_source_selection()
         self.after(100, self._drain_events)
+
+    def _source_tab_changed(self) -> None:
+        self._refresh_source_selection()
+
+    def _built_in_changed(self, _name: str) -> None:
+        self._refresh_source_selection()
+
+    def _refresh_source_selection(self) -> None:
+        built_in = self.source_tabs.get() == "Built In"
+        name = self.builtin_source.get()
+        available = bool(HARVEST_SOURCES.get(name))
+        if built_in:
+            self.builtin_status.configure(
+                text=f"{name} playlist is ready." if available else f"{name} playlist is coming soon.",
+                text_color=COLORS["success"] if available else COLORS["orange"],
+            )
+            self.category.delete(0, "end")
+            self.category.insert(0, name)
+        if hasattr(self, "harvest_button"):
+            self.harvest_button.configure(state="normal" if (not self.running and (not built_in or available)) else "disabled")
 
     def _close(self) -> None:
         if self.running:
@@ -177,15 +261,34 @@ class VideoHarvesterDialog(ctk.CTkToplevel):
     def _start(self) -> None:
         if self.running:
             return
+        mode = self.source_tabs.get()
+        if mode == "Custom":
+            source_urls = [line.strip() for line in self.urls.get("1.0", "end").splitlines() if line.strip()]
+            if not source_urls:
+                messagebox.showerror("Video Harvester", "Paste at least one video or playlist URL.", parent=self)
+                return
+        else:
+            source_url = HARVEST_SOURCES.get(self.builtin_source.get(), "")
+            if not source_url:
+                messagebox.showinfo("Video Harvester", f"The {self.builtin_source.get()} playlist has not been added yet.", parent=self)
+                return
+            source_urls = [source_url]
         self.running = True
         self.harvest_button.configure(state="disabled", text="HARVESTING…")
         self.progress.set(0)
         category = self.category.get().strip() or "Harvested"
+        segment_seconds = int(round(self.segment_seconds.get()))
+        max_videos = int(round(self.video_count.get()))
+        include_audio = self.sound_var.get()
 
         def worker() -> None:
             try:
-                results = harvest_playlist(DEFAULT_HARVEST_PLAYLIST, category, 60, lambda value, message: self.events.put(("progress", value, message)))
-                self.events.put(("done", results, category))
+                results = harvest_sources(
+                    source_urls, category, segment_seconds,
+                    lambda value, message: self.events.put(("progress", value, message)),
+                    max_videos=max_videos, include_audio=include_audio,
+                )
+                self.events.put(("done", results, category, segment_seconds))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
 
@@ -203,15 +306,17 @@ class VideoHarvesterDialog(ctk.CTkToplevel):
                     results: list[HarvestResult] = event[1]
                     count = sum(len(result.segments) for result in results)
                     self.running = False
-                    self.harvest_button.configure(state="normal", text="DOWNLOAD & CUT")
+                    self.harvest_button.configure(text="DOWNLOAD & CUT")
+                    self._refresh_source_selection()
                     self.progress.set(1)
                     self.status.configure(text=f"Finished • {count} clips from {len(results)} video(s)", text_color=COLORS["success"])
-                    self.master_app._log(f"Video Harvester added {count} one-minute clips")
+                    self.master_app._log(f"Video Harvester added {count} clips ({event[3]} seconds each)")
                     self.master_app._refresh_video_library()
                     messagebox.showinfo("Harvest complete", f"Created {count} clips in videos\\{event[2]}.", parent=self)
                 elif event[0] == "error":
                     self.running = False
-                    self.harvest_button.configure(state="normal", text="DOWNLOAD & CUT")
+                    self.harvest_button.configure(text="DOWNLOAD & CUT")
+                    self._refresh_source_selection()
                     self.status.configure(text="Harvest failed", text_color=COLORS["danger"])
                     self._write_log(event[1])
                     messagebox.showerror("Video Harvester failed", event[1], parent=self)
@@ -533,33 +638,59 @@ class SettingsDialog(ctk.CTkToplevel):
         audio_tab = self.tabs.tab("Audio & Voice")
         self._page_heading(audio_tab, "audio", "Audio & Voice", "Narration provider, voice, speed, and music")
 
-        self.provider_var = ctk.StringVar(value="Azure Speech" if current.provider == "azure" else "OpenRouter Flux")
+        provider_labels = {"flux": "OpenRouter Flux", "azure": "Azure Speech", "elevenlabs": "ElevenLabs"}
+        self.provider_var = ctk.StringVar(value=provider_labels.get(current.provider, "OpenRouter Flux"))
         ctk.CTkSegmentedButton(
-            audio_tab, values=["OpenRouter Flux", "Azure Speech"], variable=self.provider_var,
+            audio_tab, values=["OpenRouter Flux", "Azure Speech", "ElevenLabs"], variable=self.provider_var,
+            command=self._show_audio_provider,
             selected_color=COLORS["accent"], selected_hover_color=COLORS["accent_hover"],
         ).pack(fill="x", padx=20, pady=(0, 10))
         form = ctk.CTkScrollableFrame(audio_tab, fg_color=COLORS["panel_2"], corner_radius=12, height=260)
         form.pack(fill="both", expand=True, padx=20)
-        self.key_entry = self._field(form, "OPENROUTER API KEY", current.api_key, show="•")
-        self.model_entry = self._field(form, "FLUX MODEL", current.model)
-        self.voice_entry = self._field(form, "FLUX VOICE ID", current.voice)
-        self.azure_key_entry = self._field(form, "AZURE SPEECH KEY", current.azure_key, show="•")
-        self.azure_region_entry = self._field(form, "AZURE REGION", current.azure_region)
-        self.azure_voice_entry = self._field(form, "AZURE VOICE", current.azure_voice)
-        source_text = f"Loaded from: {current.source}" if current.source else "No saved key detected"
-        ctk.CTkLabel(form, text=source_text, text_color=COLORS["muted"], font=ctk.CTkFont(size=11), wraplength=470).pack(anchor="w", padx=20, pady=(0, 18))
 
-        voices = ctk.CTkFrame(form, fg_color="transparent")
-        voices.pack(fill="x", padx=20, pady=(12, 0))
+        self.audio_provider_frames: dict[str, ctk.CTkFrame] = {}
+        self.audio_provider_host = ctk.CTkFrame(form, fg_color="transparent")
+        self.audio_provider_host.pack(fill="x")
+        flux_form = ctk.CTkFrame(self.audio_provider_host, fg_color="transparent")
+        self.audio_provider_frames["OpenRouter Flux"] = flux_form
+        ctk.CTkLabel(flux_form, text="OPENROUTER FLUX", text_color=COLORS["accent"], font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=20, pady=(16, 0))
+        self.key_entry = self._field(flux_form, "API KEYS  •  SEPARATE WITH COMMAS", ", ".join(current.api_keys), show="•")
+        self.openrouter_key_mode = self._key_mode_selector(flux_form, current.api_key_mode)
+        self.model_entry = self._field(flux_form, "FLUX MODEL", current.model)
+        self.voice_entry = self._field(flux_form, "FLUX VOICE ID", current.voice)
+
+        voices = ctk.CTkFrame(flux_form, fg_color="transparent")
+        voices.pack(fill="x", padx=20, pady=(12, 2))
         ctk.CTkLabel(voices, text="ALL FLUX VOICES", text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(side="left")
         self.voice_picker = ctk.CTkOptionMenu(
-            voices,
-            values=list(FLUX_VOICES),
-            command=self._pick_voice,
+            voices, values=list(FLUX_VOICES), command=self._pick_voice,
             fg_color=COLORS["panel_2"], button_color=COLORS["accent"],
         )
         self.voice_picker.set(valid_flux_voice(current.voice))
         self.voice_picker.pack(side="right")
+        ctk.CTkButton(flux_form, text="Get OpenRouter key", fg_color="transparent", border_width=1, border_color=COLORS["border"], command=lambda: webbrowser.open("https://openrouter.ai/settings/keys")).pack(anchor="w", padx=20, pady=(12, 4))
+
+        azure_form = ctk.CTkFrame(self.audio_provider_host, fg_color="transparent")
+        self.audio_provider_frames["Azure Speech"] = azure_form
+        ctk.CTkLabel(azure_form, text="AZURE SPEECH", text_color=COLORS["accent"], font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=20, pady=(16, 0))
+        self.azure_key_entry = self._field(azure_form, "API KEYS  •  SEPARATE WITH COMMAS", ", ".join(current.azure_keys), show="•")
+        self.azure_key_mode = self._key_mode_selector(azure_form, current.azure_key_mode)
+        self.azure_region_entry = self._field(azure_form, "AZURE REGION", current.azure_region)
+        self.azure_voice_entry = self._field(azure_form, "AZURE VOICE", current.azure_voice)
+
+        elevenlabs_form = ctk.CTkFrame(self.audio_provider_host, fg_color="transparent")
+        self.audio_provider_frames["ElevenLabs"] = elevenlabs_form
+        ctk.CTkLabel(elevenlabs_form, text="ELEVENLABS", text_color=COLORS["accent"], font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=20, pady=(16, 0))
+        self.elevenlabs_key_entry = self._field(elevenlabs_form, "API KEYS  •  SEPARATE WITH COMMAS", ", ".join(current.elevenlabs_keys), show="•")
+        self.elevenlabs_key_mode = self._key_mode_selector(elevenlabs_form, current.elevenlabs_key_mode)
+        self.elevenlabs_voice_entry = self._field(elevenlabs_form, "ELEVENLABS VOICE ID", current.elevenlabs_voice)
+        self.elevenlabs_model_entry = self._field(elevenlabs_form, "ELEVENLABS MODEL", current.elevenlabs_model)
+        ctk.CTkButton(elevenlabs_form, text="Get ElevenLabs key", fg_color="transparent", border_width=1, border_color=COLORS["border"], command=lambda: webbrowser.open("https://elevenlabs.io/app/settings/api-keys")).pack(anchor="w", padx=20, pady=(12, 4))
+
+        self._show_audio_provider(self.provider_var.get())
+
+        source_text = f"Loaded from: {current.source}" if current.source else "No saved key detected"
+        ctk.CTkLabel(form, text=source_text, text_color=COLORS["muted"], font=ctk.CTkFont(size=11), wraplength=470).pack(anchor="w", padx=20, pady=(0, 18))
         self.voice_speed_label = self._slider_label(form, "VOICE SPEED", master.preferences.voice_speed, "×")
         self.voice_speed = ctk.CTkSlider(form, from_=0.85, to=1.15, number_of_steps=6, progress_color=COLORS["accent"], command=lambda v: self.voice_speed_label.configure(text=f"VOICE SPEED  •  {v:.2f}×"))
         self.voice_speed.set(master.preferences.voice_speed)
@@ -578,8 +709,7 @@ class SettingsDialog(ctk.CTkToplevel):
         ctk.CTkButton(library_actions, text="Edit pronunciations", fg_color=COLORS["panel_2"], command=lambda: self._open_file(APP_DIR / "pronunciations.json")).pack(side="left", padx=8)
         voice_actions = ctk.CTkFrame(form, fg_color="transparent")
         voice_actions.pack(fill="x", padx=20, pady=(4, 4))
-        ctk.CTkButton(voice_actions, text="Get OpenRouter key", fg_color="transparent", border_width=1, border_color=COLORS["border"], command=lambda: webbrowser.open("https://openrouter.ai/settings/keys")).pack(side="left")
-        ctk.CTkButton(voice_actions, text="Test voice", fg_color=COLORS["accent"], command=self._test_voice).pack(side="left", padx=8)
+        ctk.CTkButton(voice_actions, text="Test selected voice", fg_color=COLORS["accent"], command=self._test_voice).pack(side="left")
         self.test_status = ctk.CTkLabel(form, text="", text_color=COLORS["muted"], font=ctk.CTkFont(size=11), wraplength=650, justify="left")
         self.test_status.pack(anchor="w", padx=20, pady=(4, 14))
 
@@ -590,6 +720,13 @@ class SettingsDialog(ctk.CTkToplevel):
         actions.pack(fill="x", padx=30, pady=(0, 20))
         ctk.CTkButton(actions, text="Cancel", fg_color="transparent", border_width=1, border_color=COLORS["border"], command=self.destroy).pack(side="left")
         ctk.CTkButton(actions, text="Save all settings", width=160, fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"], command=self._save).pack(side="right")
+
+    def _show_audio_provider(self, provider: str) -> None:
+        for frame in self.audio_provider_frames.values():
+            frame.pack_forget()
+        selected = self.audio_provider_frames.get(provider)
+        if selected is not None:
+            selected.pack(fill="x")
 
     def _page_heading(self, parent, icon_name: str, title: str, subtitle: str) -> None:
         row = ctk.CTkFrame(parent, fg_color="transparent")
@@ -735,6 +872,15 @@ class SettingsDialog(ctk.CTkToplevel):
         entry.insert(0, value)
         return entry
 
+    def _key_mode_selector(self, parent, mode: str) -> ctk.StringVar:
+        ctk.CTkLabel(parent, text="KEY SELECTION MODE", text_color=COLORS["muted"], font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=20, pady=(12, 6))
+        variable = ctk.StringVar(value=KEY_MODE_LABELS.get(mode, KEY_MODE_LABELS["single"]))
+        ctk.CTkSegmentedButton(
+            parent, values=list(KEY_MODE_VALUES), variable=variable,
+            selected_color=COLORS["accent"], selected_hover_color=COLORS["accent_hover"],
+        ).pack(fill="x", padx=20)
+        return variable
+
     def _open_file(self, path: Path) -> None:
         if path.is_dir():
             path.mkdir(parents=True, exist_ok=True)
@@ -792,15 +938,7 @@ class SettingsDialog(ctk.CTkToplevel):
         prefs.auto_update = self.auto_update_var.get()
         save_preferences(prefs)
 
-        config = OpenRouterConfig(
-            provider="azure" if self.provider_var.get() == "Azure Speech" else "flux",
-            api_key=self.key_entry.get().strip(),
-            model=self.model_entry.get().strip(),
-            voice=self.voice_entry.get().strip(),
-            azure_key=self.azure_key_entry.get().strip(),
-            azure_region=self.azure_region_entry.get().strip(),
-            azure_voice=self.azure_voice_entry.get().strip(),
-        )
+        config = self._voice_config_from_form()
         save_openrouter_config(config)
         self.master_app.tts_config = load_openrouter_config()
         self.master_app.update_key_badge()
@@ -812,14 +950,26 @@ class SettingsDialog(ctk.CTkToplevel):
         self.voice_entry.delete(0, "end")
         self.voice_entry.insert(0, voice)
 
-    def _test_voice(self) -> None:
-        config = OpenRouterConfig(
-            provider="azure" if self.provider_var.get() == "Azure Speech" else "flux",
-            api_key=self.key_entry.get().strip(), model=self.model_entry.get().strip(),
+    def _voice_config_from_form(self) -> OpenRouterConfig:
+        providers = {"OpenRouter Flux": "flux", "Azure Speech": "azure", "ElevenLabs": "elevenlabs"}
+        return OpenRouterConfig(
+            provider=providers.get(self.provider_var.get(), "flux"),
+            api_keys=parse_api_keys(self.key_entry.get()),
+            api_key_mode=KEY_MODE_VALUES.get(self.openrouter_key_mode.get(), "single"),
+            model=self.model_entry.get().strip(),
             voice=self.voice_entry.get().strip(),
-            azure_key=self.azure_key_entry.get().strip(), azure_region=self.azure_region_entry.get().strip(),
+            azure_keys=parse_api_keys(self.azure_key_entry.get()),
+            azure_key_mode=KEY_MODE_VALUES.get(self.azure_key_mode.get(), "single"),
+            azure_region=self.azure_region_entry.get().strip(),
             azure_voice=self.azure_voice_entry.get().strip(),
+            elevenlabs_keys=parse_api_keys(self.elevenlabs_key_entry.get()),
+            elevenlabs_key_mode=KEY_MODE_VALUES.get(self.elevenlabs_key_mode.get(), "single"),
+            elevenlabs_voice=self.elevenlabs_voice_entry.get().strip(),
+            elevenlabs_model=self.elevenlabs_model_entry.get().strip(),
         )
+
+    def _test_voice(self) -> None:
+        config = self._voice_config_from_form()
         if not config.configured:
             self.test_status.configure(text="Enter an API key first.", text_color=COLORS["danger"])
             return
@@ -831,7 +981,7 @@ class SettingsDialog(ctk.CTkToplevel):
                 preview_dir.mkdir(parents=True, exist_ok=True)
                 path, _engine = synthesize_speech(
                     "Here is your AutoTok voice preview.", config,
-                    preview_dir / config.voice, allow_local_fallback=False,
+                    preview_dir / config.provider, allow_local_fallback=False,
                     speed=self.master_app.preferences.voice_speed,
                 )
                 self.after(0, lambda: self._voice_test_done(path, None))
@@ -1286,6 +1436,11 @@ class AutoTokApp(ctk.CTk):
         self._build_source_panel()
         self._build_editor()
         self._build_render_panel()
+        self.version_label = ctk.CTkLabel(
+            self, text=f"AutoTok v{__version__}", text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=10), anchor="w",
+        )
+        self.version_label.grid(row=2, column=0, sticky="sw", padx=18, pady=(2, 6))
         self.after(100, self._drain_events)
         if self.preferences.auto_update:
             self.after(1200, lambda: self._check_for_updates(manual=False))
@@ -1320,7 +1475,7 @@ class AutoTokApp(ctk.CTk):
 
     def update_key_badge(self) -> None:
         if self.tts_config.configured:
-            provider = "AZURE" if self.tts_config.provider == "azure" else "FLUX"
+            provider = {"azure": "AZURE", "elevenlabs": "ELEVENLABS", "flux": "FLUX"}.get(self.tts_config.provider, "VOICE")
             self.key_badge.configure(text=f"SETTINGS  •  {provider}", fg_color="#173329", hover_color="#204538", text_color=COLORS["success"])
         else:
             self.key_badge.configure(text="SETTINGS  •  VOICE", fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"], text_color="white")
@@ -1505,7 +1660,7 @@ class AutoTokApp(ctk.CTk):
         self.log_box.pack(fill="both", expand=True, padx=20, pady=(0, 10))
         self._log("AutoTok Studio ready")
         if self.tts_config.configured:
-            self._log("Flux voice configuration found (not yet validated)")
+            self._log(f"{_provider_display_name(self.tts_config.provider)} voice configuration found (not yet validated)")
         else:
             self._log("No API key; Windows voice fallback enabled")
 
